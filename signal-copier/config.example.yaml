@@ -1,0 +1,41 @@
+# Copy to config.yaml. Secrets go in .env, never here.
+
+mode: record            # record | paper | live
+
+telegram:
+  channels:             # @username or numeric id of the signal channel(s)
+    - "@example_signals"
+  session_name: signal_copier
+
+parser:
+  rules_file: null      # null = built-in src/signal_copier/parser/rules.yaml
+  # How to treat "XAUUSD BUY 2345" (price/zone without LIMIT/STOP word):
+  # market = open at market now, the price is only a reference for risk checks
+  bare_price_entry: market   # market | limit
+  max_price_deviation_pct: 10   # SL/TP further than this from entry => not confident
+
+risk:
+  risk_per_trade_pct: 0.5
+  max_open_positions: 5
+  max_positions_per_symbol: 2
+  daily_loss_limit_pct: 2.0
+  max_entry_slippage_sl_fraction: 0.3   # reject if price moved > 30% of SL distance
+  max_signal_age_seconds: 60
+  max_spread:                            # in price units, per OANDA instrument
+    XAU_USD: 0.50
+    EUR_USD: 0.00025
+    US30_USD: 4.0
+    NAS100_USD: 2.5
+  default_max_spread_sl_fraction: 0.15  # fallback: spread <= 15% of SL distance
+
+executor:
+  tp_split: equal       # split units equally across TPs
+  retry_attempts: 4
+  retry_base_delay_s: 1.0
+
+storage:
+  sqlite_path: data/signal_copier.sqlite
+
+logging:
+  level: INFO
+  json: true

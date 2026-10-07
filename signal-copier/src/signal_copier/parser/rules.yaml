@@ -1,0 +1,98 @@
+# Parser rules. Text is normalized before matching: NFKC, UPPERCASE,
+# emojis removed (except emoji_replacements), "XAU/USD" -> "XAUUSD",
+# thousands separators removed ("2,345.50" -> "2345.50").
+# All patterns are Python regexes matched against that normalized text.
+# Use (?P<price>...) / (?P<percent>...) / (?P<tp>...) named groups where noted.
+
+emoji_replacements:
+  "✅": " HIT "
+  "🎯": " HIT "
+
+# Alias -> OANDA instrument. Longest alias wins; matched as a whole word.
+symbols:
+  GOLD: XAU_USD
+  XAUUSD: XAU_USD
+  XAU: XAU_USD
+  SILVER: XAG_USD
+  XAGUSD: XAG_USD
+  US30: US30_USD
+  DJ30: US30_USD
+  DOW: US30_USD
+  DOWJONES: US30_USD
+  WS30: US30_USD
+  NAS100: NAS100_USD
+  NASDAQ: NAS100_USD
+  US100: NAS100_USD
+  USTEC: NAS100_USD
+  NQ: NAS100_USD
+  SPX500: SPX500_USD
+  US500: SPX500_USD
+  SP500: SPX500_USD
+  GER40: DE30_EUR
+  GER30: DE30_EUR
+  DE40: DE30_EUR
+  DAX: DE30_EUR
+  UK100: UK100_GBP
+  USOIL: WTICO_USD
+  WTI: WTICO_USD
+  OIL: WTICO_USD
+  UKOIL: BCO_USD
+  BRENT: BCO_USD
+  BTCUSD: BTC_USD   # OANDA crypto CFDs are not available in every region
+  BTC: BTC_USD
+
+# Any 6-letter pair of these currencies maps to AAA_BBB (EURUSD -> EUR_USD).
+fx_currencies: [EUR, USD, GBP, JPY, CHF, AUD, NZD, CAD, SGD, HKD, NOK, SEK, PLN, ZAR, MXN, TRY, CZK, HUF, DKK, CNH]
+
+side:
+  BUY: ['\bBUY\b', '\bLONG\b']
+  SELL: ['\bSELL\b', '\bSHORT\b']
+
+pending_order:            # "BUY LIMIT", "SELL STOP"
+  LIMIT: ['\b(?:BUY|SELL)\s+LIMIT\b']
+  STOP: ['\b(?:BUY|SELL)\s+STOP\b']
+
+market_words: ['\bNOW\b', '\bMARKET\b', '\bCMP\b', '\bINSTANT\b', '\bEXECUTION\b']
+
+# Entry keyword; matched per line, the price/zone must follow on the same line.
+entry: '(?:\bENTRY(?:[ \t]+PRICE)?|\bENTER\b|\bOPEN(?:[ \t]+PRICE)?\b|\bPRICE\b|@)[ \t]*[:=@\-]?[ \t]*'
+sl: '\b(?:SL|S/L|STOP[ \t]*LOSS|STOPLOSS)\b[ \t]*[:=@\-]?[ \t]*(?P<price>\d+(?:\.\d+)?)'
+# TP keyword (optionally numbered TP1/TP2). Numbers after it until the next keyword are TPs.
+tp_keyword: '\b(?:TP|T/P|TAKE[ \t]*PROFIT)(?:[ \t]*\d(?![\d.]))?(?![A-Z])[ \t]*[:=@\-]?'
+# Noise removed from TP/SL lines before reading numbers.
+noise: ['\([^)]*\)', '[+\-]?\d+(?:\.\d+)?\s*(?:PIPS?|POINTS?|PTS|%)', '\bRR\s*\d+\s*:\s*\d+']
+
+# Follow-up commands. Checked in this order; a matched action can suppress others.
+follow_ups:
+  - action: CLOSE_PARTIAL
+    patterns:
+      - '\bCLOSE\s+(?:HALF|PARTIAL(?:LY)?|PARTIALS)\b'
+      - '\b(?:TAKE|SECURE|BOOK)\s+(?:SOME\s+)?(?:PARTIALS?|HALF)\b'
+      - '\bCLOSE\s+(?P<percent>\d{1,3})\s*%'
+    default_fraction: 0.5
+    suppresses: [CLOSE]
+  - action: MOVE_SL_BE
+    patterns:
+      - '\b(?:MOVE|SET|PUT|SHIFT)\s+(?:THE\s+)?(?:SL|STOP\s*LOSS|STOP)\s+(?:TO\s+)?(?:BE|B/E|BREAK\s*EVEN|ENTRY)\b'
+      - '\b(?:SL|STOP\s*LOSS)\s+(?:TO\s+|AT\s+)?(?:BE|B/E|BREAK\s*EVEN|ENTRY)\b'
+      - '\bBREAK\s*EVEN\b'
+    suppresses: [MOVE_SL]
+  - action: MOVE_SL
+    patterns:
+      - '\b(?:MOVE|SET|PUT|SHIFT)\s+(?:THE\s+)?(?:SL|STOP\s*LOSS|STOP)\s+(?:TO\s+|AT\s+)?(?P<price>\d+(?:\.\d+)?)'
+      - '\bNEW\s+(?:SL|STOP\s*LOSS)\s*[:=@\-]?\s*(?P<price>\d+(?:\.\d+)?)'
+  - action: TP_HIT
+    patterns:
+      - '\bTP\s*(?P<tp>\d)\s*(?:IS\s+)?(?:HIT|DONE|REACHED|SMASHED)\b'
+  - action: SL_HIT
+    patterns:
+      - '\b(?:SL|STOP\s*LOSS)\s+(?:IS\s+)?(?:HIT|TAKEN)\b'
+      - '\bSTOPPED\s+OUT\b'
+  - action: CANCEL
+    patterns:
+      - '\bCANCEL(?:LED)?\b'
+      - '\b(?:DELETE|REMOVE)\s+(?:THE\s+)?(?:ORDER|LIMIT|PENDING)\b'
+  - action: CLOSE
+    patterns:
+      - '\bCLOSE(?:\s+(?:ALL|NOW|IT|FULL|THE\s+TRADE|TRADE|POSITION))?\b'
+      - '\bEXIT(?:\s+NOW)?\b'
