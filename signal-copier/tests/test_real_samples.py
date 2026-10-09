@@ -18,6 +18,13 @@ Target Profit 1 @ 0.69446
 Target Profit 2 @ 0.69563
 Stop Loss @ 0.69311"""
 
+AUDCAD_SIGNAL = """RTED Investing - Premium Trading Signals 🏆
+AUDCAD
+Sell now @ 0.99541
+Target Profit 1 @ 0.99359
+Target Profit 2 @ 0.99179
+Stop Loss @ 0.99723"""
+
 AUDUSD_CLOSE = "‼️ Close AUDUSD Manually now at 0.69530! (+1.43%)"
 
 
@@ -71,3 +78,14 @@ def test_rted_style_sell_variant(parser):
     )
     s = parser.parse(msg(text, 503)).signals[0]
     assert s.side is Side.SELL and s.tp == [D("0.69356"), D("0.69239")] and s.sl == D("0.69491")
+
+
+def test_rted_audcad_sell_signal(parser):
+    r = parser.parse(msg(AUDCAD_SIGNAL, 504))
+    assert r.status is ParseStatus.SIGNAL
+    s = r.signals[0]
+    assert (s.symbol, s.side) == ("AUD_CAD", Side.SELL)
+    assert s.entry.type is EntryType.MARKET and s.entry.price == D("0.99541")
+    assert s.sl == D("0.99723")
+    assert s.tp == [D("0.99359"), D("0.99179")]
+    assert s.warnings == []
