@@ -6,6 +6,7 @@ telegram:
   channels:             # @username or numeric id of the signal channel(s)
     - "@example_signals"
   session_name: signal_copier
+  session_dir: data       # Telethon session file lives here (keep it secret, it is your login)
 
 parser:
   rules_file: null      # null = built-in src/signal_copier/parser/rules.yaml
@@ -29,9 +30,13 @@ risk:
   default_max_spread_sl_fraction: 0.15  # fallback: spread <= 15% of SL distance
 
 executor:
-  tp_split: equal       # split units equally across TPs
+  tp_split: equal       # split units equally across TPs (one trade per TP)
   retry_attempts: 4
   retry_base_delay_s: 1.0
+  request_timeout_s: 10
+  pending_order_expiry_minutes: 240   # LIMIT/STOP orders expire after this
+  follow_up_symbol_lookback_hours: 24 # "AUDUSD close" without reply -> latest AUDUSD signal in this window
+  monitor_interval_s: 30              # how often closed trades / filled limits are checked
 
 storage:
   sqlite_path: data/signal_copier.sqlite
