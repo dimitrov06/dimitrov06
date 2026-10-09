@@ -25,6 +25,13 @@ Target Profit 1 @ 0.99359
 Target Profit 2 @ 0.99179
 Stop Loss @ 0.99723"""
 
+XAUUSD_SIGNAL = """RTED Investing - Premium Trading Signals 🏆
+XAUUSD
+Buy Market Order @ 4479.69
+Target Profit 1 @ 4484.30
+Target Profit 2 @ 4498.30
+Stop Loss @ 4470.38"""
+
 AUDUSD_CLOSE = "‼️ Close AUDUSD Manually now at 0.69530! (+1.43%)"
 
 
@@ -88,4 +95,15 @@ def test_rted_audcad_sell_signal(parser):
     assert s.entry.type is EntryType.MARKET and s.entry.price == D("0.99541")
     assert s.sl == D("0.99723")
     assert s.tp == [D("0.99359"), D("0.99179")]
+    assert s.warnings == []
+
+
+def test_rted_xauusd_buy_market_order(parser):
+    r = parser.parse(msg(XAUUSD_SIGNAL, 505))
+    assert r.status is ParseStatus.SIGNAL
+    s = r.signals[0]
+    assert (s.symbol, s.side) == ("XAU_USD", Side.BUY)
+    assert s.entry.type is EntryType.MARKET and s.entry.price == D("4479.69")
+    assert s.sl == D("4470.38")
+    assert s.tp == [D("4484.30"), D("4498.30")]
     assert s.warnings == []
