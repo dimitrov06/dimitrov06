@@ -58,7 +58,7 @@ market_words: ['\bNOW\b', '\bMARKET\b', '\bCMP\b', '\bINSTANT\b', '\bEXECUTION\b
 entry: '(?:\bENTRY(?:[ \t]+PRICE)?|\bENTER\b|\bOPEN(?:[ \t]+PRICE)?\b|\bPRICE\b|@)[ \t]*[:=@\-]?[ \t]*'
 sl: '\b(?:SL|S/L|STOP[ \t]*LOSS|STOPLOSS)\b[ \t]*[:=@\-]?[ \t]*(?P<price>\d+(?:\.\d+)?)'
 # TP keyword (optionally numbered TP1/TP2). Numbers after it until the next keyword are TPs.
-tp_keyword: '\b(?:TP|T/P|TAKE[ \t]*PROFIT)(?:[ \t]*\d(?![\d.]))?(?![A-Z])[ \t]*[:=@\-]?'
+tp_keyword: '\b(?:TP|T/P|TAKE[ \t]*PROFIT|TARGET(?:[ \t]*PROFIT)?)(?:[ \t]*\d(?![\d.]))?(?![A-Z])[ \t]*[:=@\-]?'
 # Noise removed from TP/SL lines before reading numbers.
 noise: ['\([^)]*\)', '[+\-]?\d+(?:\.\d+)?\s*(?:PIPS?|POINTS?|PTS|%)', '\bRR\s*\d+\s*:\s*\d+']
 
@@ -94,5 +94,7 @@ follow_ups:
       - '\b(?:DELETE|REMOVE)\s+(?:THE\s+)?(?:ORDER|LIMIT|PENDING)\b'
   - action: CLOSE
     patterns:
+      # "Close AUDUSD manually now at 0.69530" -> price = the channel's close price (for record-mode stats)
+      - '\bCLOSE\b[^\n]*?\bAT\s+(?P<price>\d+(?:\.\d+)?)'
       - '\bCLOSE(?:\s+(?:ALL|NOW|IT|FULL|THE\s+TRADE|TRADE|POSITION))?\b'
       - '\bEXIT(?:\s+NOW)?\b'

@@ -196,6 +196,8 @@ class SignalParser:
         lines = block.splitlines()
         # 1) explicit "ENTRY 2345" / "@ 2345-2350"
         for line in lines:
+            if self.rules.sl_keyword.search(line) or self.rules.tp_keyword.search(line):
+                continue  # "Target Profit 1 @ 0.69446" is not the entry
             line = self._strip_noise(line)
             m = re.search(self.rules.entry.pattern + PRICE_OR_ZONE.pattern, line)
             if m:

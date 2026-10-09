@@ -100,7 +100,7 @@ class FollowUp(BaseModel):
     symbol: str | None = None  # fallback when the group writes "GOLD close"
     fraction: Decimal | None = None  # CLOSE_PARTIAL, e.g. 0.5
     tp_index: int | None = None  # TP_HIT, 1-based
-    price: Decimal | None = None  # MOVE_SL
+    price: Decimal | None = None  # MOVE_SL target, or price the channel quotes for CLOSE
     raw_text: str
     date: datetime
     edited: bool = False
