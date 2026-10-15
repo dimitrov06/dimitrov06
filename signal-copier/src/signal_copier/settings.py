@@ -23,6 +23,23 @@ class Mode(str, Enum):
     LIVE = "live"
 
 
+class Broker(str, Enum):
+    MT5 = "mt5"  # IC Markets via MetaTrader 5 terminal (Windows)
+    OANDA = "oanda"
+
+
+class Mt5Cfg(BaseModel):
+    # canonical instrument (parser output) -> broker symbol; anything missing: XAU_USD -> XAUUSD
+    symbol_map: dict[str, str] = Field(default_factory=lambda: {
+        "US30_USD": "US30", "NAS100_USD": "USTEC", "SPX500_USD": "US500", "DE30_EUR": "DE40",
+        "UK100_GBP": "UK100", "WTICO_USD": "XTIUSD", "BCO_USD": "XBRUSD",
+    })
+    symbol_suffix: str = ""  # e.g. ".a" if the account's symbols carry a suffix
+    magic: int = 770077  # marks the bot's own positions in MT5
+    deviation_points: int = 20  # max slippage the terminal accepts on market orders
+    init_timeout_ms: int = 60000
+
+
 class TelegramCfg(BaseModel):
     channels: list[str | int] = Field(default_factory=list)
     session_name: str = "signal_copier"
@@ -67,6 +84,8 @@ class LoggingCfg(BaseModel):
 
 class Settings(BaseModel):
     mode: Mode = Mode.RECORD
+    broker: Broker = Broker.MT5
+    mt5: Mt5Cfg = Field(default_factory=Mt5Cfg)
     telegram: TelegramCfg = Field(default_factory=TelegramCfg)
     parser: ParserCfg = Field(default_factory=ParserCfg)
     risk: RiskCfg = Field(default_factory=RiskCfg)
@@ -85,6 +104,10 @@ class Secrets(BaseModel):
     oanda_practice_account_id: str | None = None
     oanda_live_token: str | None = None
     oanda_live_account_id: str | None = None
+    mt5_login: int | None = None
+    mt5_password: str | None = None
+    mt5_server: str | None = None
+    mt5_path: str | None = None  # terminal64.exe; optional if MT5 is installed in the default place
     live_confirm: str = "no"
 
     @classmethod
@@ -105,9 +128,29 @@ class OandaCredentials(BaseModel):
     account_id: str
 
 
+class Mt5Credentials(BaseModel):
+    login: int
+    password: str
+    server: str
+    path: str | None = None
+    expect_demo: bool  # paper -> must be a demo account, live -> must be a real one
+
+
+def mt5_credentials(settings: Settings, secrets: Secrets) -> Mt5Credentials | None:
+    """None in record mode or for another broker. Raises ConfigError if something is missing."""
+    if settings.mode is Mode.RECORD or settings.broker is not Broker.MT5:
+        return None
+    if settings.mode is Mode.LIVE and secrets.live_confirm != "yes":
+        raise ConfigError("MODE=live requires LIVE_CONFIRM=yes in .env")
+    if not (secrets.mt5_login and secrets.mt5_password and secrets.mt5_server):
+        raise ConfigError(f"MODE={settings.mode.value} with broker mt5 needs MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env")
+    return Mt5Credentials(login=secrets.mt5_login, password=secrets.mt5_password, server=secrets.mt5_server,
+                          path=secrets.mt5_path, expect_demo=settings.mode is Mode.PAPER)
+
+
 def oanda_credentials(settings: Settings, secrets: Secrets) -> OandaCredentials | None:
-    """None in record mode. Raises ConfigError if the mode's credentials are missing."""
-    if settings.mode is Mode.RECORD:
+    """None in record mode or for another broker. Raises ConfigError if the mode's credentials are missing."""
+    if settings.mode is Mode.RECORD or settings.broker is not Broker.OANDA:
         return None
     if settings.mode is Mode.LIVE:
         if secrets.live_confirm != "yes":
@@ -130,4 +173,5 @@ def load(config_path: str | Path = "config.yaml", env_path: str | Path | None = 
     settings = Settings.model_validate(data)
     secrets = Secrets.from_env()
     oanda_credentials(settings, secrets)  # fail fast on bad mode/secrets
+    mt5_credentials(settings, secrets)
     return settings, secrets

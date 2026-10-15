@@ -7,7 +7,7 @@ import asyncio
 import sys
 
 from signal_copier import log
-from signal_copier.settings import ConfigError, load, oanda_credentials
+from signal_copier.settings import ConfigError, load, mt5_credentials, oanda_credentials
 
 
 async def _login(settings, secrets) -> None:
@@ -27,10 +27,28 @@ async def _login(settings, secrets) -> None:
 async def _check(settings, secrets) -> None:
     from signal_copier.executor import OandaClient
 
-    print(f"mode: {settings.mode.value}")
+    print(f"mode: {settings.mode.value}, broker: {settings.broker.value}")
+    if (mcreds := mt5_credentials(settings, secrets)) is not None:
+        from signal_copier.executor.mt5 import Mt5Client
+
+        client = Mt5Client(mcreds, settings.mt5)
+        try:
+            acc = await client.connect()
+            a = await client.account_summary()
+            print(f"MT5 ok: {acc['login']} @ {acc['server']} ({'demo' if acc['demo'] else 'REAL'}), "
+                  f"balance {a['balance']} {a['currency']}, equity {a['NAV']}")
+            for inst in ("XAU_USD", "EUR_USD", "US30_USD"):
+                try:
+                    bid, ask, _ = await client.pricing(inst)
+                    print(f"  {inst} -> {client.symbol(inst)}: {bid} / {ask}")
+                except Exception as e:
+                    print(f"  {inst} -> {client.symbol(inst)}: {e}")
+        finally:
+            await client.aclose()
+        return
     creds = oanda_credentials(settings, secrets)
     if creds is None:
-        print("record mode: OANDA not used")
+        print("record mode: broker not used")
         return
     client = OandaClient(creds)
     try:

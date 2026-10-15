@@ -7,12 +7,13 @@ import signal as os_signal
 
 from signal_copier import log
 from signal_copier.executor import Executor, OandaClient
+from signal_copier.executor.mt5 import Mt5Client, Mt5Executor
 from signal_copier.listener import TelegramListener, make_client
 from signal_copier.notifier import Notifier
 from signal_copier.parser import ParserRules, SignalParser
 from signal_copier.pipeline import Pipeline
 from signal_copier.risk import RiskManager
-from signal_copier.settings import ConfigError, Secrets, Settings, oanda_credentials
+from signal_copier.settings import ConfigError, Secrets, Settings, mt5_credentials, oanda_credentials
 from signal_copier.storage import Storage
 
 logger = log.get("app")
@@ -26,12 +27,15 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
         max_price_deviation_pct=settings.parser.max_price_deviation_pct,
     )
     notifier = Notifier(secrets.notify_bot_token, secrets.notify_chat_id)
-    creds = oanda_credentials(settings, secrets)
+    ex = settings.executor
     client = executor = None
-    if creds is not None:
-        ex = settings.executor
+    if (creds := oanda_credentials(settings, secrets)) is not None:
         client = OandaClient(creds, ex.request_timeout_s, ex.retry_attempts, ex.retry_base_delay_s)
         executor = Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s, ex.pending_order_expiry_minutes)
+    elif (mcreds := mt5_credentials(settings, secrets)) is not None:
+        client = Mt5Client(mcreds, settings.mt5)
+        executor = Mt5Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s,
+                               ex.pending_order_expiry_minutes)
     pipeline = Pipeline(settings, storage, parser, notifier, RiskManager(settings.risk), client, executor)
     return pipeline, client, notifier
 
@@ -55,6 +59,8 @@ async def run(settings: Settings, secrets: Secrets) -> None:
         raise ConfigError("telegram.channels is empty in config.yaml")
 
     pipeline, client, notifier = build_pipeline(settings, secrets)
+    if isinstance(client, Mt5Client):
+        await client.connect()  # also refuses a real account in paper mode and a demo account in live mode
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGINT, os_signal.SIGTERM):
@@ -67,7 +73,8 @@ async def run(settings: Settings, secrets: Secrets) -> None:
                      settings.telegram.session_name)
     listener = TelegramListener(tg, settings.telegram.channels, pipeline.storage, pipeline.handle_message)
 
-    await notifier.send(f"🚀 signal-copier стартира в режим {settings.mode.value}.")
+    broker = "" if client is None else f", брокер {settings.broker.value}"
+    await notifier.send(f"🚀 signal-copier стартира в режим {settings.mode.value}{broker}.")
     tasks = [
         asyncio.create_task(listener.run(stop), name="listener"),
         asyncio.create_task(notifier.poll_commands(pipeline.handle_command, stop), name="commands"),

@@ -1,11 +1,11 @@
 # signal-copier
 
-Следи Telegram канал за трейдинг сигнали и ги копира в OANDA (v20 REST API).
+Следи Telegram канал за трейдинг сигнали и ги копира в **IC Markets през MetaTrader 5** (по подразбиране) или в OANDA (v20 REST API). Брокерът се избира с `broker:` в `config.yaml`.
 
 | Режим | Какво прави |
 |---|---|
 | `record` (по подразбиране) | Само чете, парсва и записва сигналите и командите в SQLite. Никаква търговия. |
-| `paper` | Търгува на OANDA **practice** акаунт. |
+| `paper` | Търгува на **демо** акаунт (MT5 demo / OANDA practice). Ботът отказва да тръгне, ако MT5 акаунтът е реален. |
 | `live` | Търгува на реален акаунт. Стартира само ако в `.env` има `LIVE_CONFIRM=yes`. |
 
 Препоръчителен ред: седмици в `record` → оценка дали групата е печеливша (скрипт с M1 свещи, предстои) → `paper` → чак тогава `live`.
@@ -13,7 +13,7 @@
 ## Как работи
 
 ```
-Telegram канал ──► listener/ ──► parser/ ──► risk/ ──► executor/ ──► OANDA
+Telegram канал ──► listener/ ──► parser/ ──► risk/ ──► executor/ ──► MT5 (или OANDA)
    (Telethon)        нови +       Signal /     размер,     market/limit,
                      редакции     FollowUp     лимити      SL/TP, retry
                          │            │           │            │
@@ -34,15 +34,43 @@ Telegram канал ──► listener/ ──► parser/ ──► risk/ ──
 
 ### Без двойни поръчки
 
-Всяка част от поръчката има детерминистично client ID (`sc_<chat>_<msg>_<idx>_<part>`), което се записва в SQLite **преди** изпращане и се праща към OANDA. При мрежова грешка ботът първо пита OANDA за това ID и праща отново само ако OANDA никога не го е получавала. При рестарт: Telethon не преизпълнява пропуснати съобщения, всяко съобщение се дедупликира, а редакции на стари съобщения, които ботът не е виждал, се игнорират.
+Всяка част от поръчката има детерминистично client ID (`sc_<chat>_<msg>_<idx>_<part>`), което се записва в SQLite **преди** изпращане. В MT5 то отива като кратък таг в коментара на поръчката (MT5 позволява до 31 символа), в OANDA като clientExtensions.id. При грешка или липсващ отговор ботът първо търси тага в отворените позиции, чакащите поръчки и историята и праща отново само ако брокерът никога не е получавал поръчката. Requote се повтаря с нова цена. При рестарт: Telethon не преизпълнява пропуснати съобщения, всяко съобщение се дедупликира, а редакции на стари съобщения, които ботът не е виждал, се игнорират.
+
+## IC Markets / MT5: къде върви ботът
+
+Официалната Python библиотека `MetaTrader5` работи **само на Windows** и говори с пуснат MT5 терминал на същата машина. Затова:
+
+- **`record` режим** не ползва брокер и върви навсякъде, включително на Linux VPS с Docker (по-долу).
+- **`paper` / `live` с MT5** изискват **Windows VPS** (или Windows компютър, който е включен постоянно) с инсталиран MT5 терминал на IC Markets.
+
+Размерът е в **лотове**: 0.5% риск / (разстояние до SL × стойност на 1.0 движение за 1 лот, взета от MT5 за символа). Пример от канала: AUDUSD, SL 9.1 пипа, баланс 10 000 USD → 0.54 лота, разделени на 0.27 + 0.27 за двата TP. Минимум 0.01 лот; ако сметката е твърде малка за два дяла, се отваря една позиция.
+
+Символите се превръщат в имената на IC Markets: `XAU_USD` → `XAUUSD`, `EUR_USD` → `EURUSD`, `US30_USD` → `US30`, `NAS100_USD` → `USTEC` и т.н. (`mt5.symbol_map` в `config.yaml`). `python -m signal_copier check` показва цените на няколко символа, за да видиш, че имената съвпадат.
+
+### Windows VPS (paper/live с MT5)
+
+1. Инсталирай MT5 от IC Markets, влез в **демо** акаунта и включи бутона **Algo Trading** (иначе поръчките се отказват). В Tools → Options → Expert Advisors разреши *Allow algorithmic trading*.
+2. Инсталирай Python 3.11+ (от python.org, с отметка *Add to PATH*) и Git.
+3. В PowerShell:
+   ```powershell
+   git clone https://github.com/dimitrov06/dimitrov06.git; cd dimitrov06\signal-copier
+   python -m venv .venv; .\.venv\Scripts\Activate.ps1
+   pip install -e ".[mt5]"
+   copy .env.example .env; copy config.example.yaml config.yaml   # попълни ги
+   python -m signal_copier login     # еднократен вход в Telegram
+   python -m signal_copier check     # проверява MT5 връзката, акаунта (demo/real) и символите
+   python -m signal_copier run
+   ```
+   В `.env`: `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` (напр. `ICMarketsSC-Demo`), по желание `MT5_PATH` до `terminal64.exe`. В `config.yaml`: `mode: paper`, `broker: mt5`.
+4. Автоматичен старт: Task Scheduler → *Create Task* → *Run whether user is logged on or not*, trigger *At startup*, action `C:\…\signal-copier\.venv\Scripts\python.exe -m signal_copier run`, *Start in* = папката `signal-copier`. MT5 терминалът също трябва да се стартира автоматично (сложи го в Startup).
 
 ## Първоначална настройка
 
-Нужно ти е: VPS с Docker (или Python 3.11+), Telegram акаунт, който е член на канала, OANDA practice акаунт.
+Нужно ти е: Telegram акаунт, който е член на канала; за `record` – Linux VPS с Docker; за търговия с MT5 – Windows VPS (виж по-горе).
 
 1. **Telegram API ключ** (за userbot-а, чете канала като теб): влез в <https://my.telegram.org> → *API development tools* → създай приложение → вземи `api_id` и `api_hash`.
 2. **Твой бот за известия**: в Telegram пиши на `@BotFather` → `/newbot` → вземи токена. Пиши каквото и да е на новия бот, после отвори `https://api.telegram.org/bot<TOKEN>/getUpdates` и вземи `message.chat.id` – това е `NOTIFY_CHAT_ID`. Ботът изпълнява команди само от този chat.
-3. **OANDA**: в practice акаунта → *Manage API Access* → генерирай токен; account ID е във вида `101-004-1234567-001`.
+3. **Брокер** (само за `paper`/`live`): за IC Markets MT5 – login, парола и сървър на демо акаунта (виж горе). За OANDA (`broker: oanda`) – practice акаунт → *Manage API Access* → токен и account ID.
 4. Конфигурация:
    ```bash
    git clone https://github.com/dimitrov06/dimitrov06.git && cd dimitrov06/signal-copier
@@ -66,9 +94,9 @@ docker compose run --rm -it signal-copier login
 
 Без Docker: `python -m venv .venv && . .venv/bin/activate && pip install -e . && python -m signal_copier login`.
 
-Проверка на OANDA връзката (за `paper`/`live`): `docker compose run --rm signal-copier check`.
+Проверка на връзката с брокера (за `paper`/`live`): `python -m signal_copier check`.
 
-## Стартиране и деплой на VPS
+## Стартиране и деплой на Linux VPS (record режим, или OANDA)
 
 ```bash
 docker compose up -d --build       # стартира във фонов режим, рестартира се сам
@@ -108,7 +136,7 @@ sqlite3 data/signal_copier.sqlite "select ts, kind, decision, reason, signal_key
 
 ## Парсер
 
-Правилата са в `src/signal_copier/parser/rules.yaml` (regex-и, синоними на символи → OANDA формат: `GOLD`/`XAUUSD` → `XAU_USD`, `US30` → `US30_USD`, `EURUSD` → `EUR_USD`…). Може да се подаде собствен файл чрез `parser.rules_file`. Реалните примери от канала са тестове в `tests/test_real_samples.py` – добавяй всеки нов формат там.
+Правилата са в `src/signal_copier/parser/rules.yaml` (regex-и, синоними на символи → общ формат: `GOLD`/`XAUUSD` → `XAU_USD`, `US30` → `US30_USD`, `EURUSD` → `EUR_USD`…; брокерът после ги превежда към своите имена). Може да се подаде собствен файл чрез `parser.rules_file`. Реалните примери от канала са тестове в `tests/test_real_samples.py` – добавяй всеки нов формат там.
 
 ## Структура
 
@@ -119,7 +147,8 @@ src/signal_copier/
   parser/          текст -> Signal / FollowUp (rules.yaml)
   listener/        Telethon userbot
   risk/            проверки и размер на позицията
-  executor/        OANDA v20 клиент + изпълнение, idempotent retry, мониторинг
+  executor/        mt5.py (IC Markets MetaTrader 5) и oanda.py/executor.py (OANDA v20):
+                   изпълнение, retry без двойни поръчки, мониторинг на затворени сделки
   storage/         SQLite
   notifier/        твоят бот: известия + /stop /status /resume
   pipeline.py      съобщение -> parse -> record | risk -> execute -> store + notify
@@ -136,8 +165,8 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Тестовете на изпълнението вървят срещу фалшив OANDA (`tests/conftest.py`), без мрежа.
+Тестовете на изпълнението вървят срещу фалшив MT5 (`tests/fake_mt5.py`) и фалшив OANDA (`tests/conftest.py`), без мрежа и без терминал.
 
 ## Предстои
 
-- Скрипт за оценка на `record` данните: за всеки записан сигнал изтегля M1 свещи от OANDA и симулира влизане с реално забавяне и спред → печалба/загуба, win rate, максимален drawdown.
+- Скрипт за оценка на `record` данните: за всеки записан сигнал изтегля M1 свещи от IC Markets (MT5 `copy_rates_range`) и симулира влизане с реално забавяне и спред → печалба/загуба, win rate, максимален drawdown.
