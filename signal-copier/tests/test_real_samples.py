@@ -107,3 +107,26 @@ def test_rted_xauusd_buy_market_order(parser):
     assert s.sl == D("4470.38")
     assert s.tp == [D("4484.30"), D("4498.30")]
     assert s.warnings == []
+
+
+# Entry formats from the RTED "Trading Signals Instructions" manual.
+@pytest.mark.parametrize("text, symbol, side, etype, price", [
+    ("RTED Investing - Premium Trading Signals 🏆\nXAUUSD\nBuy Limit Order @ 4460.00\n"
+     "Target Profit 1 @ 4470.00\nTarget Profit 2 @ 4490.00\nStop Loss @ 4450.00",
+     "XAU_USD", Side.BUY, EntryType.LIMIT, "4460.00"),
+    ("RTED Investing - Premium Trading Signals 🏆\nNASDAQ\nSell Stop Order @ 18,000\n"
+     "Target Profit 1 @ 17,900\nTarget Profit 2 @ 17,750\nStop Loss @ 18,100",
+     "NAS100_USD", Side.SELL, EntryType.STOP, "18000"),
+    ("RTED Investing - Premium Trading Signals 🏆\nBTCUSD\nBuy Stop Order @ 65,000\n"
+     "Target Profit 1 @ 66,000\nTarget Profit 2 @ 68,000\nStop Loss @ 63,500",
+     "BTC_USD", Side.BUY, EntryType.STOP, "65000"),
+    ("RTED Investing - Premium Trading Signals 🏆\nEURUSD\nSell Limit Order @ 1.08500\n"
+     "Target Profit 1 @ 1.08300\nTarget Profit 2 @ 1.08000\nStop Loss @ 1.08700",
+     "EUR_USD", Side.SELL, EntryType.LIMIT, "1.08500"),
+])
+def test_rted_manual_entry_formats(parser, text, symbol, side, etype, price):
+    r = parser.parse(msg(text, 700))
+    assert r.status is ParseStatus.SIGNAL, r.issues
+    s = r.signals[0]
+    assert (s.symbol, s.side, s.entry.type) == (symbol, side, etype)
+    assert s.entry.price == D(price) and len(s.tp) == 2 and s.sl is not None

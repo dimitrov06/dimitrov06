@@ -168,7 +168,7 @@ async def _no_sleep(_):
 def make_pipeline(fake):
     created = []
 
-    def _make(mode: Mode = Mode.PAPER, clock_offset_s: int = 5, **risk_overrides):
+    def _make(mode: Mode = Mode.PAPER, clock_offset_s: int = 5, tp_mode: str = "equal", **risk_overrides):
         settings = Settings.model_validate({"mode": mode.value, "risk": risk_overrides})
         storage = Storage(":memory:")
         notifier = Notifier(None, None)
@@ -177,7 +177,7 @@ def make_pipeline(fake):
             creds = OandaCredentials(base_url="https://fake", token="t", account_id="ACC")
             client = OandaClient(creds, retry_attempts=3, retry_base_delay_s=0, transport=fake.transport(),
                                  sleep=_no_sleep)
-            executor = Executor(client, storage, retry_attempts=3, retry_base_delay_s=0)
+            executor = Executor(client, storage, retry_attempts=3, retry_base_delay_s=0, tp_mode=tp_mode)
         p = Pipeline(settings, storage, SignalParser(), notifier, RiskManager(settings.risk), client, executor,
                      clock=lambda: NOW + timedelta(seconds=clock_offset_s))
         created.append(p)

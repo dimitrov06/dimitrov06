@@ -45,7 +45,8 @@ risk:
   default_max_spread_sl_fraction: 0.15  # fallback: spread <= 15% of SL distance
 
 executor:
-  tp_split: equal       # split units equally across TPs (one trade per TP)
+  tp_split: last        # last = one trade, TP = last TP (RTED manual: TP2 is the target, TP1 is only watched)
+                        # equal = one trade per TP, size split equally
   retry_attempts: 4
   retry_base_delay_s: 1.0
   request_timeout_s: 10

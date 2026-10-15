@@ -45,13 +45,13 @@ def msg(text, message_id, reply_to=None, edited=False):
                            edited=edited)
 
 
-def make(fake: FakeMt5, demo_expected=True):
+def make(fake: FakeMt5, demo_expected=True, tp_mode="equal"):
     settings = Settings.model_validate({"mode": "paper" if demo_expected else "live"})
     creds = Mt5Credentials(login=5100123, password="pw", server="ICMarketsSC-Demo", expect_demo=demo_expected)
     client = Mt5Client(creds, Mt5Cfg(), mt5_module=fake)
     client.sleep = _no_sleep
     storage = Storage(":memory:")
-    executor = Mt5Executor(client, storage, retry_attempts=3, retry_base_delay_s=0)
+    executor = Mt5Executor(client, storage, retry_attempts=3, retry_base_delay_s=0, tp_mode=tp_mode)
     p = Pipeline(settings, storage, SignalParser(), Notifier(None, None), RiskManager(settings.risk), client,
                  executor, clock=lambda: NOW + timedelta(seconds=5))
     return p, client
@@ -177,3 +177,47 @@ def test_daily_loss_limit_uses_equity():
     fake.equity = 9790.0
     run(p.monitor_once())
     assert p.halted_reason() == "daily_loss_limit"
+
+
+def test_rted_mode_one_position_with_tp2():
+    """RTED manual: one trade, TP2 is the platform take-profit, TP1 is only an observation level."""
+    fake = FakeMt5()
+    p, _ = make(fake, tp_mode="last")
+    run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
+    sends = fake.market_sends()
+    assert len(sends) == 1
+    assert sends[0]["volume"] == 0.54 and sends[0]["tp"] == 0.69563 and sends[0]["sl"] == 0.69311
+    run(p.handle_message(msg("TP1 hit ✅ move SL to BE", 503, reply_to=501)))
+    (pos,) = fake.positions.values()
+    assert pos.sl == 0.69402 and pos.tp == 0.69563
+    run(p.handle_message(msg(AUDUSD_CLOSE, 504, reply_to=501)))
+    assert fake.positions == {}
+
+
+def test_rted_mode_edit_keeps_tp2():
+    fake = FakeMt5()
+    p, _ = make(fake, tp_mode="last")
+    run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
+    run(p.handle_message(msg(AUDUSD_SIGNAL.replace("0.69563", "0.69600"), 501, edited=True)))
+    (pos,) = fake.positions.values()
+    assert pos.tp == 0.69600
+
+
+def test_entry_after_adverse_move_is_allowed_with_same_risk():
+    """Manual: entering after price moved against the signal (but not past SL) is fine."""
+    fake = FakeMt5()
+    fake.ticks["AUDUSD"] = (0.69350, 0.69352)  # 4.9 pips below the signal's 0.69401, SL at 0.69311
+    p, _ = make(fake, tp_mode="last")
+    run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
+    (send,) = fake.market_sends()
+    # 50 USD / (0.00041 * 100000) = 1.21 lots: tighter SL, bigger size, same 0.5% risk
+    assert send["volume"] == 1.21
+
+
+def test_entry_after_move_towards_tp_is_skipped():
+    fake = FakeMt5()
+    fake.ticks["AUDUSD"] = (0.69430, 0.69432)  # 3.1 pips towards TP > 0.3 x 9 pips
+    p, _ = make(fake, tp_mode="last")
+    run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
+    assert fake.market_sends() == []
+    assert p.storage.get_signal("-1001:501:0")["status"] == "REJECTED"

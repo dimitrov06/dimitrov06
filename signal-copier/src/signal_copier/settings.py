@@ -6,6 +6,7 @@ import os
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
@@ -64,7 +65,9 @@ class RiskCfg(BaseModel):
 
 
 class ExecutorCfg(BaseModel):
-    tp_split: str = "equal"
+    # "last": one trade with the last TP (RTED manual: TP2 is the target, TP1 only an observation level)
+    # "equal": one trade per TP, size split equally
+    tp_split: Literal["last", "equal"] = "last"
     retry_attempts: int = 4
     retry_base_delay_s: float = 1.0
     request_timeout_s: float = 10.0

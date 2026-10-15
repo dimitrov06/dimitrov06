@@ -53,7 +53,7 @@ def test_size_rounds_down():
     (sig(), ctx(open_positions=5), "max_open_positions"),
     (sig(), ctx(open_positions_symbol=2), "max_positions_per_symbol"),
     (sig(), ctx(bid=D("1.09900"), ask=D("1.10000")), "spread_too_wide"),
-    (sig(), ctx(bid=D("1.09799"), ask=D("1.09800")), "price_moved_too_far"),
+    (sig(), ctx(bid=D("1.10199"), ask=D("1.10200")), "price_moved_too_far"),
     (sig(), ctx(bid=D("1.09400"), ask=D("1.09401")), "price_beyond_sl"),
     (sig(), ctx(bid=D("1.11100"), ask=D("1.11101")), "price_beyond_tp1"),
     (sig(), ctx(nav=D(9790)), "daily_loss_limit"),
@@ -94,3 +94,22 @@ def test_split_units():
     assert split_units(D(10), 2, 0, D(1)) == [D(5), D(5)]
     assert split_units(D(11), 3, 0, D(1)) == [D(3), D(3), D(5)]
     assert split_units(D(1), 2, 0, D(1)) == [D(1)]  # too small to split
+
+
+def test_adverse_move_before_sl_is_allowed():
+    d = rm.check(sig(), ctx(bid=D("1.09699"), ask=D("1.09700")))  # 30 pips against, SL 20 pips further
+    assert d.approved and d.sl_distance == D("0.002") and d.units == D(25000)
+
+
+def test_sell_moved_towards_tp_is_rejected():
+    s = sig(side=Side.SELL, price="1.10000", sl="1.10500", tp=("1.09000",))
+    assert rm.check(s, ctx(bid=D("1.09800"), ask=D("1.09801"))).reason.startswith("price_moved_too_far")
+    assert rm.check(s, ctx(bid=D("1.10300"), ask=D("1.10301"))).approved
+
+
+def test_plan_parts_modes():
+    from signal_copier.risk import plan_parts
+    tps = [D("1.1"), D("1.2")]
+    assert plan_parts(D("0.54"), tps, "last", 2, D("0.01")) == [(D("0.54"), D("1.2"))]
+    assert plan_parts(D("0.54"), tps, "equal", 2, D("0.01")) == [(D("0.27"), D("1.1")), (D("0.27"), D("1.2"))]
+    assert plan_parts(D("0.54"), [], "last", 2, D("0.01")) == [(D("0.54"), None)]

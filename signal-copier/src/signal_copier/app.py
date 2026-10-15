@@ -31,11 +31,12 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
     client = executor = None
     if (creds := oanda_credentials(settings, secrets)) is not None:
         client = OandaClient(creds, ex.request_timeout_s, ex.retry_attempts, ex.retry_base_delay_s)
-        executor = Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s, ex.pending_order_expiry_minutes)
+        executor = Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s, ex.pending_order_expiry_minutes,
+                            ex.tp_split)
     elif (mcreds := mt5_credentials(settings, secrets)) is not None:
         client = Mt5Client(mcreds, settings.mt5)
         executor = Mt5Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s,
-                               ex.pending_order_expiry_minutes)
+                               ex.pending_order_expiry_minutes, ex.tp_split)
     pipeline = Pipeline(settings, storage, parser, notifier, RiskManager(settings.risk), client, executor)
     return pipeline, client, notifier
 

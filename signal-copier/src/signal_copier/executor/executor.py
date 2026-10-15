@@ -15,7 +15,7 @@ from decimal import ROUND_DOWN, Decimal
 from signal_copier import log
 from signal_copier.executor.oanda import OandaClient, OandaError, TransientError
 from signal_copier.models import EntryType, FollowUp, FollowUpAction, Side, Signal
-from signal_copier.risk import InstrumentInfo, RiskDecision, split_units
+from signal_copier.risk import InstrumentInfo, RiskDecision, plan_parts, tp_for_part
 from signal_copier.storage import Storage
 
 logger = log.get("executor")
@@ -47,22 +47,24 @@ class ExecResult:
 
 class Executor:
     def __init__(self, client: OandaClient, storage: Storage, retry_attempts: int = 4,
-                 retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240):
+                 retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240,
+                 tp_mode: str = "last"):
         self.client = client
         self.storage = storage
         self.retry_attempts = retry_attempts
         self.retry_base_delay_s = retry_base_delay_s
         self.pending_expiry = timedelta(minutes=pending_expiry_minutes)
+        self.tp_mode = tp_mode
 
     # ------------------------------------------------------------ open trades
 
     async def open_signal(self, s: Signal, decision: RiskDecision, info: InstrumentInfo) -> ExecResult:
         result = ExecResult()
-        tps: list[Decimal | None] = list(s.tp) or [None]
-        sizes = split_units(decision.units, len(tps), info.trade_units_precision, info.minimum_trade_size)
+        parts = plan_parts(decision.units, list(s.tp), self.tp_mode, info.trade_units_precision,
+                           info.minimum_trade_size)
         sign = Decimal(1) if s.side is Side.BUY else Decimal(-1)
 
-        for part, (units, tp) in enumerate(zip(sizes, tps)):
+        for part, (units, tp) in enumerate(parts):
             cid = client_id(s, part)
             price = None if s.entry.type is EntryType.MARKET else s.entry.reference_price
             created = self.storage.create_order(cid, s.key, part, s.symbol, units * sign, s.entry.type.value,
@@ -240,7 +242,7 @@ class Executor:
         orders = {o["oanda_trade_id"]: o for o in self.storage.orders_for_signal(signal_key) if o["oanda_trade_id"]}
         for t in self.storage.trades_for_signal(signal_key, open_only=True):
             part = orders.get(t["trade_id"], {}).get("part", 0)
-            tp = tps[part] if part < len(tps) else None
+            tp = tp_for_part(tps, part, self.tp_mode)
             await self.client.set_trade_orders(
                 t["trade_id"],
                 sl=fmt_price(sl, info) if sl is not None else None,

@@ -23,7 +23,7 @@ from typing import Any
 from signal_copier import log
 from signal_copier.executor.executor import ExecResult, client_id
 from signal_copier.models import EntryType, FollowUp, FollowUpAction, Side, Signal
-from signal_copier.risk import InstrumentInfo, RiskDecision, split_units
+from signal_copier.risk import InstrumentInfo, RiskDecision, plan_parts, tp_for_part
 from signal_copier.settings import ConfigError, Mt5Cfg, Mt5Credentials
 from signal_copier.storage import Storage
 
@@ -137,13 +137,15 @@ class Mt5Client:
 
 class Mt5Executor:
     def __init__(self, client: Mt5Client, storage: Storage, retry_attempts: int = 4,
-                 retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240):
+                 retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240,
+                 tp_mode: str = "last"):
         self.client = client
         self.mt5 = client.mt5
         self.storage = storage
         self.retry_attempts = retry_attempts
         self.retry_base_delay_s = retry_base_delay_s
         self.pending_expiry = timedelta(minutes=pending_expiry_minutes)
+        self.tp_mode = tp_mode
 
     # ------------------------------------------------------------ helpers
 
@@ -193,12 +195,12 @@ class Mt5Executor:
 
     async def open_signal(self, s: Signal, decision: RiskDecision, info: InstrumentInfo) -> ExecResult:
         result = ExecResult()
-        tps: list[Decimal | None] = list(s.tp) or [None]
-        sizes = split_units(decision.units, len(tps), info.trade_units_precision, info.minimum_trade_size)
+        parts = plan_parts(decision.units, list(s.tp), self.tp_mode, info.trade_units_precision,
+                           info.minimum_trade_size)
         sign = Decimal(1) if s.side is Side.BUY else Decimal(-1)
         si = await self.client.symbol_info(s.symbol)
 
-        for part, (lots, tp) in enumerate(zip(sizes, tps)):
+        for part, (lots, tp) in enumerate(parts):
             cid = client_id(s, part)
             tag = short_tag(cid)
             price = None if s.entry.type is EntryType.MARKET else s.entry.reference_price
@@ -405,7 +407,7 @@ class Mt5Executor:
         part_by_ticket = {o["oanda_trade_id"]: o["part"] for o in self.storage.orders_for_signal(signal_key)}
         for p in await self._live_positions(signal_key):
             part = part_by_ticket.get(str(p.ticket), 0)
-            tp = tps[part] if part < len(tps) else None
+            tp = tp_for_part(tps, part, self.tp_mode)
             await self._set_sltp(p, sl=self._px(sl, info) if sl is not None else None,
                                  tp=self._px(tp, info) if tp is not None else None)
             done.append(f"#{p.ticket}: SL {sl}, TP {tp}")

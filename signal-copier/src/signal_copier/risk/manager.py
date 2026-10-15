@@ -100,12 +100,10 @@ class RiskManager:
                 return RiskDecision.reject("price_beyond_tp1")
             ref = s.entry.reference_price
             if ref is not None:
-                if s.entry.is_zone and s.entry.zone_low <= fill <= s.entry.zone_high:
-                    moved = Decimal(0)
-                elif s.entry.is_zone:
-                    moved = min(abs(fill - s.entry.zone_low), abs(fill - s.entry.zone_high))
-                else:
-                    moved = abs(fill - ref)
+                # Only a move in the trade's favour (towards TP) counts. A move against it, still before the
+                # SL, is a better entry with a tighter SL; the size below adapts so the risk stays the same.
+                best = (s.entry.zone_high if buy else s.entry.zone_low) if s.entry.is_zone else ref
+                moved = max(fill - best if buy else best - fill, Decimal(0))
                 allowed = abs(ref - s.sl) * cfg.max_entry_slippage_sl_fraction
                 if moved > allowed:
                     return RiskDecision.reject(f"price_moved_too_far:{moved}>{allowed}")
@@ -119,6 +117,32 @@ class RiskManager:
         return RiskDecision(
             approved=True, units=units, entry_price=entry_price, sl_distance=sl_distance, risk_amount=risk_amount
         )
+
+
+TP_MODES = ("last", "equal")
+
+
+def plan_parts(units: Decimal, tps: list[Decimal], mode: str, precision: int,
+               minimum: Decimal) -> list[tuple[Decimal, Decimal | None]]:
+    """Orders to send for one signal as (size, take-profit) pairs.
+
+    "last": one order with the last TP (RTED: TP2 is the real target, TP1 is only an observation level).
+    "equal": one order per TP, size split equally.
+    """
+    if not tps:
+        return [(units, None)]
+    if mode == "last":
+        return [(units, tps[-1])]
+    sizes = split_units(units, len(tps), precision, minimum)
+    return list(zip(sizes, tps))
+
+
+def tp_for_part(tps: list[Decimal], part: int, mode: str) -> Decimal | None:
+    if not tps:
+        return None
+    if mode == "last":
+        return tps[-1]
+    return tps[part] if part < len(tps) else None
 
 
 def split_units(units: Decimal, parts: int, precision: int, minimum: Decimal) -> list[Decimal]:

@@ -21,7 +21,7 @@ def setup(fake, attempts=3):
     storage = Storage(":memory:")
     client = OandaClient(OandaCredentials(base_url="https://fake", token="t", account_id="ACC"),
                          retry_attempts=attempts, retry_base_delay_s=0, transport=fake.transport(), sleep=_no_sleep)
-    return storage, Executor(client, storage, retry_attempts=attempts, retry_base_delay_s=0)
+    return storage, Executor(client, storage, retry_attempts=attempts, retry_base_delay_s=0, tp_mode="equal")
 
 
 def gold(side=Side.BUY, entry=None, tp=("4484.30", "4498.30"), sl="4470.38", message_id=900):
