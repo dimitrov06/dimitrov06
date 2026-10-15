@@ -130,3 +130,13 @@ def test_rted_manual_entry_formats(parser, text, symbol, side, etype, price):
     s = r.signals[0]
     assert (s.symbol, s.side, s.entry.type) == (symbol, side, etype)
     assert s.entry.price == D(price) and len(s.tp) == 2 and s.sl is not None
+
+
+def test_rted_xauusd_sell_limit_2026_10_15(parser):
+    text = ("RTED Investing - Premium Trading Signals 🏆\nXAUUSD\nSell Limit Order @ 4156.56\n"
+            "Target Profit 1 @ 4153.58\nTarget Profit 2 @ 4142.80\nStop Loss @ 4162.55")
+    r = parser.parse(msg(text, 800))
+    assert r.status is ParseStatus.SIGNAL
+    s = r.signals[0]
+    assert (s.symbol, s.side, s.entry.type, s.entry.price) == ("XAU_USD", Side.SELL, EntryType.LIMIT, D("4156.56"))
+    assert s.sl == D("4162.55") and s.tp == [D("4153.58"), D("4142.80")] and not s.warnings
