@@ -11,7 +11,9 @@ from signal_copier.settings import ConfigError, load, mt5_check_credentials, oan
 
 
 async def _login(settings, secrets) -> None:
-    from signal_copier.listener import make_client
+    from telethon import utils
+
+    from signal_copier.listener import make_client, resolve_channel
 
     client = make_client(secrets.tg_api_id, secrets.tg_api_hash, settings.telegram.session_dir,
                          settings.telegram.session_name)
@@ -19,8 +21,8 @@ async def _login(settings, secrets) -> None:
     me = await client.get_me()
     print(f"Logged in as {me.first_name} (id {me.id}). Session saved in {settings.telegram.session_dir}/")
     for ch in settings.telegram.channels:
-        entity = await client.get_entity(ch)
-        print(f"  channel ok: {ch} -> {getattr(entity, 'title', entity)}")
+        entity = await resolve_channel(client, ch)
+        print(f"  channel ok: {ch} -> {getattr(entity, 'title', entity)} (id {utils.get_peer_id(entity)})")
     await client.disconnect()
 
 

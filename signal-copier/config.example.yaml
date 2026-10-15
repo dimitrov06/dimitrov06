@@ -18,7 +18,7 @@ mt5:
   deviation_points: 20  # max slippage on market orders, in points
 
 telegram:
-  channels:             # @username or numeric id of the signal channel(s)
+  channels:             # @username, numeric id (-100...) or the group name as shown in Telegram
     - "@example_signals"
   session_name: signal_copier
   session_dir: data       # Telethon session file lives here (keep it secret, it is your login)

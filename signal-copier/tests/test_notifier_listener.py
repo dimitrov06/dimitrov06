@@ -55,3 +55,16 @@ def test_to_incoming_uses_edit_date_for_edits():
     edit = to_incoming(-100, m, edited=True)
     assert new.date == NOW and edit.date == NOW + timedelta(minutes=1)
     assert edit.edited and edit.reply_to_msg_id == 3 and edit.chat_id == -100
+
+
+def test_channel_found_by_group_name():
+    import pytest
+    from signal_copier.listener.telegram import match_title
+    chats = [("rted", "RTED Investing - Premium Trading Signals SP 🏆"), ("free", "RTED Investing Free"),
+             ("mom", "Мама")]
+    assert match_title("RTED Investing - Premium Trading Signals SP", chats) == "rted"
+    assert match_title("rted investing premium trading signals", chats) == "rted"
+    with pytest.raises(ValueError, match="ambiguous"):
+        match_title("RTED Investing", chats)
+    with pytest.raises(ValueError, match="no chat"):
+        match_title("Other group", chats)

@@ -27,6 +27,36 @@ def make_client(api_id: int, api_hash: str, session_dir: str, session_name: str)
     return TelegramClient(str(Path(session_dir) / session_name), api_id, api_hash, catch_up=False)
 
 
+def _norm(title: str) -> str:
+    return " ".join("".join(c for c in title if c.isalnum() or c.isspace()).casefold().split())
+
+
+def match_title(wanted: str, titles: list[tuple[object, str]]) -> object:
+    """Pick the one dialog whose title matches: exact (ignoring case/emojis) first, then "contains"."""
+    w = _norm(wanted)
+    exact = [e for e, t in titles if _norm(t) == w]
+    if len(exact) == 1:
+        return exact[0]
+    partial = [(e, t) for e, t in titles if w in _norm(t) or (_norm(t) and _norm(t) in w)]
+    if len(exact) > 1 or len(partial) > 1:
+        names = ", ".join(t for _, t in partial) or wanted
+        raise ValueError(f"channel '{wanted}' is ambiguous: {names}. Use its numeric id (-100...) in config.yaml")
+    if not partial:
+        raise ValueError(f"no chat named '{wanted}' among your Telegram chats (are you a member?)")
+    return partial[0][0]
+
+
+async def resolve_channel(client, ch: str | int):
+    """@username, t.me link, numeric id (-100...) or the group's name as shown in Telegram."""
+    if isinstance(ch, int) or str(ch).lstrip("-").isdigit():
+        return await client.get_entity(int(ch))
+    s = str(ch).strip()
+    if s.startswith("@") or "t.me/" in s:
+        return await client.get_entity(s)
+    dialogs = await client.get_dialogs()
+    return match_title(s, [(d.entity, d.name or "") for d in dialogs])
+
+
 def to_incoming(chat_id: int, m, edited: bool) -> IncomingMessage:
     reply_to = getattr(m.reply_to, "reply_to_msg_id", None) if m.reply_to else None
     return IncomingMessage(
@@ -57,7 +87,7 @@ class TelegramListener:
 
         chat_ids = []
         for ch in self.channels:
-            entity = await self.client.get_entity(ch)
+            entity = await resolve_channel(self.client, ch)
             chat_id = utils.get_peer_id(entity)
             chat_ids.append(chat_id)
             latest = await self.client.get_messages(entity, limit=1)
