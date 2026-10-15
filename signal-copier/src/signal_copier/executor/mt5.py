@@ -76,15 +76,19 @@ class Mt5Client:
         return self.cfg.symbol_map.get(instrument, instrument.replace("_", "")) + self.cfg.symbol_suffix
 
     async def connect(self) -> dict:
-        kw = dict(login=self.creds.login, password=self.creds.password, server=self.creds.server,
-                  timeout=self.cfg.init_timeout_ms)
+        kw: dict = dict(timeout=self.cfg.init_timeout_ms)
+        if self.creds.login:
+            kw.update(login=self.creds.login, password=self.creds.password, server=self.creds.server)
         if self.creds.path:
             kw["path"] = self.creds.path
         if not await self.call("initialize", **kw):
             raise Mt5Error(f"MT5 initialize failed: {await self.call('last_error')}")
         acc = await self.call("account_info")
+        if acc is None:
+            await self.call("shutdown")
+            raise Mt5Error("MT5 terminal is not logged in to an account (log in in MT5 or set MT5_LOGIN/PASSWORD/SERVER)")
         is_demo = acc.trade_mode == ACCOUNT_TRADE_MODE_DEMO
-        if is_demo != self.creds.expect_demo:
+        if self.creds.expect_demo is not None and is_demo != self.creds.expect_demo:
             await self.call("shutdown")
             want = "demo" if self.creds.expect_demo else "real"
             raise ConfigError(f"MT5 account {acc.login} is {'demo' if is_demo else 'real'}, but this mode needs {want}")

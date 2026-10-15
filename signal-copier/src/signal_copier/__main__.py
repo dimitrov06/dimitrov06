@@ -7,7 +7,7 @@ import asyncio
 import sys
 
 from signal_copier import log
-from signal_copier.settings import ConfigError, load, mt5_credentials, oanda_credentials
+from signal_copier.settings import ConfigError, load, mt5_check_credentials, oanda_credentials
 
 
 async def _login(settings, secrets) -> None:
@@ -28,7 +28,7 @@ async def _check(settings, secrets) -> None:
     from signal_copier.executor import OandaClient
 
     print(f"mode: {settings.mode.value}, broker: {settings.broker.value}")
-    if (mcreds := mt5_credentials(settings, secrets)) is not None:
+    if (mcreds := mt5_check_credentials(settings, secrets)) is not None:
         from signal_copier.executor.mt5 import Mt5Client
 
         client = Mt5Client(mcreds, settings.mt5)

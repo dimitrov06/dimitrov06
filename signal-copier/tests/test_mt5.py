@@ -221,3 +221,14 @@ def test_entry_after_move_towards_tp_is_skipped():
     run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
     assert fake.market_sends() == []
     assert p.storage.get_signal("-1001:501:0")["status"] == "REJECTED"
+
+
+def test_connect_without_login_attaches_to_terminal_and_still_checks_demo():
+    fake = FakeMt5()
+    settings_creds = Mt5Credentials(expect_demo=True)
+    client = Mt5Client(settings_creds, Mt5Cfg(), mt5_module=fake)
+    assert run(client.connect())["demo"] is True
+    assert "login" not in fake.init_kw
+    client = Mt5Client(Mt5Credentials(expect_demo=True), Mt5Cfg(), mt5_module=FakeMt5(demo=False))
+    with pytest.raises(ConfigError, match="real"):
+        run(client.connect())

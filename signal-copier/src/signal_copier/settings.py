@@ -132,11 +132,12 @@ class OandaCredentials(BaseModel):
 
 
 class Mt5Credentials(BaseModel):
-    login: int
-    password: str
-    server: str
+    # All three empty: use the account the MT5 terminal on this PC is already logged in to.
+    login: int | None = None
+    password: str | None = None
+    server: str | None = None
     path: str | None = None
-    expect_demo: bool  # paper -> must be a demo account, live -> must be a real one
+    expect_demo: bool | None  # paper -> must be demo, live -> must be real, None -> read-only check, either
 
 
 def mt5_credentials(settings: Settings, secrets: Secrets) -> Mt5Credentials | None:
@@ -145,10 +146,25 @@ def mt5_credentials(settings: Settings, secrets: Secrets) -> Mt5Credentials | No
         return None
     if settings.mode is Mode.LIVE and secrets.live_confirm != "yes":
         raise ConfigError("MODE=live requires LIVE_CONFIRM=yes in .env")
-    if not (secrets.mt5_login and secrets.mt5_password and secrets.mt5_server):
-        raise ConfigError(f"MODE={settings.mode.value} with broker mt5 needs MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env")
+    return _mt5_creds(secrets, expect_demo=settings.mode is Mode.PAPER)
+
+
+def mt5_check_credentials(settings: Settings, secrets: Secrets) -> Mt5Credentials | None:
+    """For `check`: also in record mode (read-only), without the demo/real requirement."""
+    if settings.broker is not Broker.MT5:
+        return None
+    if settings.mode is not Mode.RECORD:
+        return mt5_credentials(settings, secrets)
+    return _mt5_creds(secrets, expect_demo=None)
+
+
+def _mt5_creds(secrets: Secrets, expect_demo: bool | None) -> Mt5Credentials:
+    given = [secrets.mt5_login, secrets.mt5_password, secrets.mt5_server]
+    if any(given) and not all(given):
+        raise ConfigError("MT5_LOGIN, MT5_PASSWORD, MT5_SERVER in .env: fill in all three, or leave all three empty "
+                          "to use the account the MT5 terminal is logged in to")
     return Mt5Credentials(login=secrets.mt5_login, password=secrets.mt5_password, server=secrets.mt5_server,
-                          path=secrets.mt5_path, expect_demo=settings.mode is Mode.PAPER)
+                          path=secrets.mt5_path, expect_demo=expect_demo)
 
 
 def oanda_credentials(settings: Settings, secrets: Secrets) -> OandaCredentials | None:

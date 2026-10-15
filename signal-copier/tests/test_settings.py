@@ -59,6 +59,13 @@ def test_mt5_live_needs_confirm_and_real_account():
     assert creds.expect_demo is False
 
 
-def test_mt5_missing_login():
+def test_mt5_partial_login_is_an_error():
     with pytest.raises(ConfigError, match="MT5_LOGIN"):
-        mt5_credentials(Settings(mode=Mode.PAPER), Secrets())
+        mt5_credentials(Settings(mode=Mode.PAPER), Secrets.from_env({"MT5_LOGIN": "5100123"}))
+
+
+def test_mt5_without_login_uses_logged_in_terminal():
+    creds = mt5_credentials(Settings(mode=Mode.PAPER), Secrets.from_env({"MT5_LOGIN": "", "MT5_PASSWORD": ""}))
+    assert creds.login is None and creds.expect_demo is True
+    from signal_copier.settings import mt5_check_credentials
+    assert mt5_check_credentials(Settings(mode=Mode.RECORD), Secrets()).expect_demo is None
