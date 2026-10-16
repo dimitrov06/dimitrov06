@@ -35,6 +35,15 @@ def _fmt_signal(s: Signal) -> str:
     return f"{s.symbol} {s.side.value} {entry} | SL {s.sl if s.sl is not None else 'няма'} | TP {tps}"
 
 
+
+HELP_TEXT = (
+    "📋 Команди:\n"
+    "/status: режим, баланс, отворени позиции и сигнали за днес\n"
+    "/stop: спира новите сделки; отворените продължават да се управляват (SL, TP, затваряне)\n"
+    "/resume: пуска отново новите сделки (дневният стоп остава до утре)\n"
+    "/help: този списък"
+)
+
 class Pipeline:
     def __init__(
         self,
@@ -309,6 +318,7 @@ class Pipeline:
             await self._halt_for_today()
 
     async def handle_command(self, cmd: str) -> str:
+        """/help, /start, /commands and anything unknown return HELP_TEXT."""
         if cmd == "/stop":
             self.storage.set_state("halt_manual", self.clock().isoformat())
             self.storage.add_event("command", "STOP")
@@ -320,7 +330,7 @@ class Pipeline:
             return f"▶️ Пуснах отново{extra}."
         if cmd == "/status":
             return await self.status_text()
-        return "Команди: /status, /stop, /resume"
+        return HELP_TEXT
 
     async def status_text(self) -> str:
         since = datetime.combine(self.clock().date(), datetime.min.time(), tzinfo=timezone.utc)

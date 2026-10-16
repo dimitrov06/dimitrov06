@@ -12,7 +12,7 @@ from signal_copier import log
 logger = log.get("notifier")
 
 CommandHandler = Callable[[str], Awaitable[str]]
-COMMANDS = ("/stop", "/resume", "/status", "/help")
+COMMANDS = ("/stop", "/resume", "/status", "/help", "/start", "/commands")
 
 
 class Notifier:
