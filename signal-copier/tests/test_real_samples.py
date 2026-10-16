@@ -140,3 +140,10 @@ def test_rted_xauusd_sell_limit_2026_10_15(parser):
     s = r.signals[0]
     assert (s.symbol, s.side, s.entry.type, s.entry.price) == ("XAU_USD", Side.SELL, EntryType.LIMIT, D("4156.56"))
     assert s.sl == D("4162.55") and s.tp == [D("4153.58"), D("4142.80")] and not s.warnings
+
+
+def test_rted_cancel_pending_order_2026_10_16(parser):
+    r = parser.parse(msg("Cancel Pending Order on XAUUSD", 1523, reply_to=1522))
+    assert r.status is ParseStatus.FOLLOW_UP
+    fu = r.follow_ups[0]
+    assert (fu.action, fu.symbol, fu.reply_to_msg_id) == (FollowUpAction.CANCEL, "XAU_USD", 1522)
