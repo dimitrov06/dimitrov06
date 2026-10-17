@@ -32,7 +32,7 @@ class Notifier:
             transport=transport,
         )
         self.sent: list[str] = []  # kept for tests / debugging
-        self.failed = 0  # messages the Bot API did not take (network down, wrong token)
+        self.failed = 0  # messages the Bot API did not take (network down, wrong token) or aclose() cut off
         self._queue: asyncio.Queue[str] | None = None
         self._worker: asyncio.Task | None = None
 
@@ -41,7 +41,11 @@ class Notifier:
             try:
                 await asyncio.wait_for(self._queue.join(), DRAIN_TIMEOUT_S)
             except asyncio.TimeoutError:
-                logger.error("notify_dropped", queued=self._queue.qsize())
+                # the one being sent (the worker always holds one while any is unfinished) and those still queued:
+                # not known to have reached the owner
+                dropped = self._queue.qsize() + 1
+                self.failed += dropped
+                logger.error("notify_dropped", messages=dropped)
             self._worker.cancel()
         await self.http.aclose()
 

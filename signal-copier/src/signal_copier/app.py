@@ -133,7 +133,6 @@ async def run(settings: Settings, secrets: Secrets) -> None:
             await client.aclose()  # the restart loop builds everything again
             pipeline.storage.close()
             raise
-    pipeline.storage.set_state(STARTUP_ERROR_KEY, None)  # started: the next config error is news again
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGINT, os_signal.SIGTERM):
@@ -142,13 +141,17 @@ async def run(settings: Settings, secrets: Secrets) -> None:
         except NotImplementedError:
             pass
 
+    broker = "" if client is None else f", брокер {settings.broker.value}"
+
+    async def started() -> None:  # logged in to Telegram, every channel found: a start that works
+        pipeline.storage.set_state(STARTUP_ERROR_KEY, None)  # the next config error is news again
+        await notifier.send(f"🚀 signal-copier стартира в режим {settings.mode.value}{broker}.")
+
     tg = make_client(secrets.tg_api_id, secrets.tg_api_hash, settings.telegram.session_dir,
                      settings.telegram.session_name)
     listener = TelegramListener(tg, settings.telegram.channels, pipeline.storage, pipeline.handle_message,
-                                notify=notifier.send)
-
-    broker = "" if client is None else f", брокер {settings.broker.value}"
-    await notifier.send(f"🚀 signal-copier стартира в режим {settings.mode.value}{broker}.")
+                                notify=notifier.send, on_ready=started)
+    startup_error: ConfigError | None = None
     tasks = [
         asyncio.create_task(listener.run(stop), name="listener"),
         asyncio.create_task(notifier.poll_commands(pipeline.handle_command, stop), name="commands"),
@@ -160,13 +163,20 @@ async def run(settings: Settings, secrets: Secrets) -> None:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         for t in done:
             if t.exception():
-                await notifier.send(f"❗ {t.get_name()} спря с грешка: {t.exception()!r}")
+                if isinstance(t.exception(), ConfigError) and not listener.ready:
+                    # Telegram not logged in, the channel gone: exit 2, and the .bat starts it again in 30 s
+                    startup_error = t.exception()
+                else:
+                    await notifier.send(f"❗ {t.get_name()} спря с грешка: {t.exception()!r}")
                 raise t.exception()
     finally:
         stop.set()
         for t in tasks:
             t.cancel()
-        await notifier.send("⏹ signal-copier спря.")
+        if startup_error is not None:  # told once, then once a day (no 🚀 was sent, so no ⏹ either)
+            await _tell_startup_error(notifier, settings.storage.sqlite_path, startup_error, pipeline.storage)
+        else:
+            await notifier.send("⏹ signal-copier спря.")
         if client is not None:
             await client.aclose()
         await notifier.aclose()

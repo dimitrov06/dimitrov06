@@ -102,13 +102,16 @@ def to_incoming(chat_id: int, m, edited: bool) -> IncomingMessage:
 
 class TelegramListener:
     def __init__(self, client, channels: list[str | int], storage: Storage, on_message: OnMessage,
-                 notify: Notify | None = None, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 notify: Notify | None = None, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 on_ready: Callable[[], Awaitable[None]] | None = None):
         self.client = client
         self.channels = channels
         self.storage = storage
         self.on_message = on_message
         self.notify = notify
         self.clock = clock
+        self.on_ready = on_ready  # called once logged in and every channel is found (no ConfigError after it)
+        self.ready = False
         self.watermarks: dict[int, int] = {}
         self._held: list | None = None  # live events waiting for the catch-up at start
 
@@ -151,6 +154,9 @@ class TelegramListener:
             if last:
                 restarted.append((chat_id, entity))
             logger.info("listening", channel=str(ch), chat_id=chat_id, watermark=self.watermarks[chat_id])
+        self.ready = True
+        if self.on_ready is not None:
+            await self.on_ready()
         await self._say("👂 Следя: " + ", ".join(names))
         # live events that arrive while the missed messages are handled wait for them, in arrival order: a "Close"
         # replying to a missed signal must not run before that signal, an edit of a missed one must not be lost

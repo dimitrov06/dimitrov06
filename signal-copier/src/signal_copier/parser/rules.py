@@ -129,12 +129,18 @@ class ParserRules:
         try:
             with open(where, encoding="utf-8") as f:
                 data = yaml.safe_load(f)
+        except UnicodeError as e:  # saved as ANSI/cp1251 or "Unicode" (UTF-16) by Notepad
+            raise ConfigError(f"parser rules {where} cannot be read: save the file as UTF-8 ({e})") from e
         except (OSError, yaml.YAMLError) as e:
             raise ConfigError(f"parser rules {where} cannot be read: {e}") from e
         if not isinstance(data, dict):
             raise ConfigError(f"parser rules {where} is not a YAML mapping of rules")
+        guards = data.get("command_guards") or {}
+        if not isinstance(guards, dict):
+            raise ConfigError(f"parser rules {where} are invalid: command_guards must be a mapping of "
+                              f"{', '.join(GUARD_KEYS)}")
         missing = [k for k in SAFETY_KEYS if not data.get(k)]
-        missing += [f"command_guards.{k}" for k in GUARD_KEYS if not (data.get("command_guards") or {}).get(k)]
+        missing += [f"command_guards.{k}" for k in GUARD_KEYS if not guards.get(k)]
         if missing:
             # an older custom rules_file would take "very close to TP1" for a CLOSE: never trade with it
             raise ConfigError(

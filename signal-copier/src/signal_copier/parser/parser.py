@@ -477,6 +477,7 @@ class SignalParser:
         found: dict[FollowUpAction, FollowUp] = {}
         suppressed: set[FollowUpAction] = set()
         covered = cmds.spans
+        full_sizes: list[tuple[int, int]] = []  # "Close XAUUSD 100% now": the partial close took 100% as a full close
         for rule in self.rules.follow_ups:
             guarded = rule.action not in INFO_ACTIONS
             fu = None
@@ -495,10 +496,12 @@ class SignalParser:
                     if fu is not None and fu.action in CLOSE_ACTIONS and (
                             self._unexplained_numbers(text, m, fu.action)
                             or rule.action is FollowUpAction.CLOSE and FollowUpAction.CLOSE not in suppressed
-                            and SIZE_AFTER_CLOSE.search(self._rest_of_sentence(text, m))):
+                            and SIZE_AFTER_CLOSE.search(self._rest_of_sentence(self._blank(text, full_sizes), m))):
                         left_out = True
                         cmds.problems.append("unclear_close_command")
                         fu = None
+                    if fu is not None and fu.action is not rule.action and m.groupdict().get("percent"):
+                        full_sizes.append((m.start("percent"), m.end()))  # the full close took this size
             cmds.dropped = cmds.dropped or left_out
             if fu is None:
                 if left_out:
