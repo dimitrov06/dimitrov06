@@ -115,12 +115,16 @@ def test_requote_is_retried_with_fresh_price():
     assert len(fake.positions) == 2 and len(fake.market_sends()) == 3
 
 
-def test_timeout_without_execution_is_retried_once():
+def test_timeout_is_never_resent():
+    """A TIMEOUT can still fill later: the part is looked for, never sent again, and left SENT for sync()."""
     fake = FakeMt5()
     fake.script = ["timeout"]
     p, _ = make(fake)
     run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
-    assert len(fake.positions) == 2
+    assert len(fake.positions) == 1 and len(fake.market_sends()) == 2
+    assert [o["status"] for o in p.storage.orders_for_signal("-1001:501:0")] == ["SENT", "FILLED"]
+    assert p.storage.get_signal("-1001:501:0")["status"] == "EXECUTED"
+    assert any("НЕ я пращам повторно" in t for t in p.notifier.sent)
 
 
 def test_close_reply_and_edit_do_not_double_close():
@@ -159,7 +163,7 @@ def test_limit_order_fill_and_tp_detected_by_monitor():
     fake.hit_tp(pos_ticket, 4495.0)
     run(p.monitor_once())
     closed = p.storage.trades_for_signal("-1001:600:0", open_only=False)[0]
-    assert closed["state"] == "CLOSED" and D(closed["realized_pl"]) == D("44.3")
+    assert closed["state"] == "CLOSED" and D(closed["realized_pl"]) == D("43.6")  # 45 - 0.7 in - 0.7 out
 
 
 def test_cancel_pending():

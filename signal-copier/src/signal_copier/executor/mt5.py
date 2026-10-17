@@ -7,7 +7,11 @@ Never-double-order rule: each order part gets a short deterministic tag
 (derived from chat/message/index/part) that is stored in SQLite before sending
 and written into the MT5 order comment. After an ambiguous result (no answer,
 timeout, lost connection) we search positions, pending orders and deal history
-for that tag and only resend if MT5 has never seen it.
+for that tag for a while and never send it again: if MT5 does not show it, the
+row stays SENT, the owner is told, and sync() adopts it if it turns up later.
+
+The package never raises: a read that returns None is an IPC/terminal error and
+is never taken for "nothing there" (Mt5Client.read raises Mt5Error instead).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
+from types import SimpleNamespace as NS
 from typing import Any
 
 from signal_copier import log
@@ -35,6 +40,8 @@ TIMEOUT, CONNECTION = 10012, 10031
 RETRY_FRESH_PRICE = {REQUOTE, PRICE_CHANGED, PRICE_OFF, TOO_MANY_REQUESTS}
 AMBIGUOUS = {TIMEOUT, CONNECTION}
 ACCOUNT_TRADE_MODE_DEMO = 0
+ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
+RES_S_OK = 1
 
 
 class Mt5Error(RuntimeError):
@@ -72,6 +79,22 @@ class Mt5Client:
             self._pool, lambda: getattr(self.mt5, fn)(*args, **kw)
         )
 
+    async def read(self, fn: str, *args, **kw):
+        """A read whose None (IPC/terminal error) raises Mt5Error; () means MT5 answered "nothing".
+
+        last_error() is asked in the same worker job, so no other call can overwrite it in between.
+        """
+        def job():
+            res = getattr(self.mt5, fn)(*args, **kw)
+            return res, (self.mt5.last_error() if res is None else None)
+
+        res, err = await asyncio.get_running_loop().run_in_executor(self._pool, job)
+        if res is not None:
+            return res
+        if err and err[0] == RES_S_OK:
+            return ()
+        raise Mt5Error(f"{fn} failed: {err}")
+
     def symbol(self, instrument: str) -> str:
         return self.cfg.symbol_map.get(instrument, instrument.replace("_", "")) + self.cfg.symbol_suffix
 
@@ -92,8 +115,35 @@ class Mt5Client:
             await self.call("shutdown")
             want = "demo" if self.creds.expect_demo else "real"
             raise ConfigError(f"MT5 account {acc.login} is {'demo' if is_demo else 'real'}, but this mode needs {want}")
+        if self.creds.expect_demo is not None:  # paper/live: refuse a terminal or account that cannot trade
+            blockers = await self.trade_blockers()
+            if blockers is None or blockers:
+                why = "; ".join(blockers) if blockers else f"MT5 не отговаря ({await self.call('last_error')})"
+                await self.call("shutdown")
+                raise ConfigError(f"MT5 не може да търгува: {why}")
         logger.info("mt5_connected", login=acc.login, server=acc.server, demo=is_demo, currency=acc.currency)
         return {"login": acc.login, "server": acc.server, "demo": is_demo}
+
+    async def trade_blockers(self) -> list[str] | None:
+        """Why the bot cannot trade on this terminal/account right now ([] = it can, None = MT5 did not answer)."""
+        term = await self.call("terminal_info")
+        acc = await self.call("account_info")
+        if term is None or acc is None:
+            return None
+        out = []
+        if not term.connected:
+            out.append("терминалът няма връзка със сървъра на брокера")
+        if not term.trade_allowed:
+            out.append("бутонът Algo Trading в MT5 е изключен")
+        if getattr(term, "tradeapi_disabled", False):
+            out.append("търговията през Python API е забранена (Tools → Options → Expert Advisors)")
+        if not acc.trade_allowed:
+            out.append("акаунтът няма право да търгува (влязъл ли си с investor паролата?)")
+        if not acc.trade_expert:
+            out.append("брокерът е забранил автоматичната търговия за акаунта")
+        if acc.margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
+            out.append("акаунтът не е hedging (ботът разчита на отделна позиция за всеки сигнал)")
+        return out
 
     async def aclose(self) -> None:
         try:
@@ -133,7 +183,7 @@ class Mt5Client:
         si = await self.symbol_info(instrument)
         tick = await self.call("symbol_info_tick", self.symbol(instrument))
         if tick is None:
-            raise Mt5Error(f"no price for {self.symbol(instrument)}")
+            raise Mt5Error(f"no price for {self.symbol(instrument)} ({await self.call('last_error')})")
         tick_value = si.trade_tick_value_loss or si.trade_tick_value
         per_price_unit = Decimal(str(tick_value)) / Decimal(str(si.trade_tick_size))
         return Decimal(str(tick.bid)), Decimal(str(tick.ask)), per_price_unit
@@ -166,23 +216,28 @@ class Mt5Executor:
         return 0.0 if value is None else float(value.quantize(Decimal(1).scaleb(-info.display_precision)))
 
     async def _positions(self, **kw) -> list:
-        res = await self.client.call("positions_get", **kw)
-        return [p for p in (res or ()) if p.magic == self.client.cfg.magic]
+        """The bot's positions. Raises Mt5Error if MT5 can't be asked (never returns [] for that)."""
+        res = await self.client.read("positions_get", **kw)
+        return [p for p in res if p.magic == self.client.cfg.magic]
 
     async def _find_by_tag(self, tag: str):
-        """('position', obj) / ('order', obj) / ('deal', obj) / None. ('unknown', None) if MT5 can't be asked."""
+        """('position', obj) / ('order', obj) / ('deal', obj) / None (MT5 answered and never saw it).
+
+        ('unknown', None) if MT5 can't be asked: a None read is an IPC error, not "not found".
+        """
         try:
             for p in await self._positions():
                 if p.comment == tag:
                     return "position", p
-            for o in await self.client.call("orders_get") or ():
+            for o in await self.client.read("orders_get"):
                 if o.comment == tag:
                     return "order", o
+            # deal times are trade-server time (IC Markets UTC+2/+3): the window must reach well past UTC now
             now = datetime.now(timezone.utc)
-            deals = await self.client.call("history_deals_get", now - timedelta(days=2), now + timedelta(hours=1))
-            for d in deals or ():
+            for d in await self.client.read("history_deals_get", now - timedelta(days=3), now + timedelta(days=1)):
                 if d.comment == tag and d.entry == self.mt5.DEAL_ENTRY_IN:
-                    return "deal", d
+                    live = await self.client.read("positions_get", ticket=d.position_id)
+                    return ("position", live[0]) if live else ("deal", d)
         except Exception as e:
             logger.error("mt5_lookup_failed", tag=tag, error=repr(e))
             return "unknown", None
@@ -215,6 +270,8 @@ class Mt5Executor:
                     result.skipped.append(cid)
                     continue
                 found = await self._find_by_tag(tag)
+                if found is None and existing["status"] == "SENT":
+                    found = ("unknown", None)  # it may have been sent before: never send it twice
                 if found is not None:
                     self._record_found(s, cid, found, lots, tp, result)
                     continue
@@ -235,7 +292,7 @@ class Mt5Executor:
             "type_filling": self._filling(si),
         }
         if s.entry.type is EntryType.MARKET:
-            tick = await self.client.call("symbol_info_tick", info.name)
+            tick = await self.client.read("symbol_info_tick", info.name)
             req.update(action=m.TRADE_ACTION_DEAL, type=m.ORDER_TYPE_BUY if buy else m.ORDER_TYPE_SELL,
                        price=tick.ask if buy else tick.bid, deviation=self.client.cfg.deviation_points,
                        type_time=m.ORDER_TIME_GTC)
@@ -250,7 +307,12 @@ class Mt5Executor:
 
     async def _send(self, s, cid, tag, lots, price, tp, info, si, result: ExecResult) -> None:
         for attempt in range(self.retry_attempts):
-            req = await self._request(s, tag, lots, price, tp, info, si)  # fresh price on every attempt
+            try:
+                req = await self._request(s, tag, lots, price, tp, info, si)  # fresh price on every attempt
+            except Mt5Error as e:  # nothing was sent in this attempt; earlier ones were refused (requotes)
+                self.storage.update_order(cid, status="FAILED")
+                result.errors.append(f"{cid}: not sent ({e})")
+                return
             self.storage.update_order(cid, status="SENT")
             try:
                 res = await self.client.call("order_send", req)
@@ -260,13 +322,14 @@ class Mt5Executor:
             if res is not None and res.retcode in (DONE, DONE_PARTIAL, PLACED):
                 await self._record_sent(s, cid, tag, res, lots, tp, result)
                 return
-            if res is not None and res.retcode in RETRY_FRESH_PRICE:
+            if res is not None and res.retcode in RETRY_FRESH_PRICE:  # refused by the server: safe to send again
                 logger.info("mt5_requote", client_id=cid, retcode=res.retcode, attempt=attempt + 1)
             elif res is None or res.retcode in AMBIGUOUS:
-                found = await self._find_by_tag(tag)
-                if found is not None:
-                    self._record_found(s, cid, found, lots, tp, result)
-                    return
+                # the server may still execute it (a TIMEOUT can fill a moment later): look, never resend
+                logger.warning("mt5_send_ambiguous", client_id=cid, retcode=getattr(res, "retcode", None),
+                               error=await self.client.call("last_error") if res is None else None)
+                self._record_found(s, cid, await self._await_tag(tag), lots, tp, result)
+                return
             else:
                 self.storage.update_order(cid, status="REJECTED", response={"retcode": res.retcode,
                                                                             "comment": res.comment})
@@ -281,17 +344,30 @@ class Mt5Executor:
         self.storage.update_order(cid, status="FAILED")
         result.errors.append(f"{cid}: not sent after {self.retry_attempts} attempts")
 
+    async def _await_tag(self, tag: str):
+        """Poll for an order whose result was lost (about 15 s with the defaults). ('unknown', None) if unseen."""
+        for attempt in range(self.retry_attempts + 1):
+            found = await self._find_by_tag(tag)
+            if found is not None and found[0] != "unknown":
+                return found
+            if attempt < self.retry_attempts:
+                await self.client.sleep(self.retry_base_delay_s * 2**attempt)
+        return "unknown", None
+
     async def _record_sent(self, s, cid, tag, res, lots, tp, result: ExecResult) -> None:
         if res.retcode == PLACED:
             self.storage.update_order(cid, status="PENDING", oanda_order_id=str(res.order),
                                       response={"retcode": res.retcode, "order": res.order})
             result.pending.append({"order_id": str(res.order), "units": str(lots), "price": res.price, "tp": tp})
             return
-        found = await self._find_by_tag(tag)
-        if found and found[0] == "position":
-            self._record_found(s, cid, found, lots, tp, result)
+        try:  # on hedging accounts the position ticket equals the opening order ticket
+            found = await self.client.read("positions_get", ticket=res.order)
+        except Mt5Error:
+            found = ()
+        if found:
+            self._record_found(s, cid, ("position", found[0]), lots, tp, result)
             return
-        ticket = str(res.order)  # on hedging accounts the position ticket equals the opening order ticket
+        ticket = str(res.order)
         self.storage.update_order(cid, status="FILLED", oanda_order_id=str(res.order), oanda_trade_id=ticket,
                                   response={"retcode": res.retcode, "deal": res.deal, "order": res.order})
         self.storage.upsert_trade(ticket, s.key, cid, s.symbol, Decimal(str(res.volume)) * self._sign(s),
@@ -314,19 +390,37 @@ class Mt5Executor:
             self.storage.update_order(cid, status="PENDING", oanda_order_id=str(obj.ticket))
             result.pending.append({"order_id": str(obj.ticket), "units": str(lots), "price": obj.price_open,
                                    "tp": tp})
-        elif kind == "deal":  # opened and already closed again
-            self.storage.update_order(cid, status="FILLED", oanda_trade_id=str(obj.position_id))
-            result.opened.append({"trade_id": str(obj.position_id), "units": str(obj.volume), "price": obj.price,
-                                  "tp": tp})
+        elif kind == "deal":  # opened and already closed again: sync() records the close and its P/L
+            ticket = str(obj.position_id)
+            self.storage.update_order(cid, status="FILLED", oanda_trade_id=ticket)
+            self.storage.upsert_trade(ticket, s.key, cid, s.symbol, Decimal(str(obj.volume)) * self._sign(s),
+                                      Decimal(str(obj.price)), datetime.now(timezone.utc).isoformat())
+            result.opened.append({"trade_id": ticket, "units": str(obj.volume), "price": obj.price, "tp": tp})
         else:
             self.storage.update_order(cid, status="SENT")
-            result.errors.append(f"{cid}: state unknown after an MT5 error, check the terminal")
+            result.unknown.append(cid)
+            result.errors.append(f"{cid}: MT5 не потвърди поръчката и не я виждам. НЕ я пращам повторно: "
+                                 "провери терминала. Ако се появи там, ботът ще я поеме сам.")
+
+    def _adopt(self, o: dict, p) -> None:
+        """Order row `o` turned out to be live position `p` in MT5: record the trade, the signal is live."""
+        sign = -1 if Decimal(o["units"]) < 0 else 1
+        self.storage.update_order(o["client_id"], status="FILLED", oanda_trade_id=str(p.ticket))
+        self.storage.upsert_trade(str(p.ticket), o["signal_key"], o["client_id"], o["instrument"],
+                                  Decimal(str(p.volume)) * sign, Decimal(str(p.price_open)),
+                                  datetime.now(timezone.utc).isoformat())
+        self._signal_live(o["signal_key"])
+
+    def _signal_live(self, signal_key: str) -> None:
+        sig = self.storage.get_signal(signal_key)
+        if sig is not None and sig["status"] != "EXECUTED":  # e.g. FAILED after an unknown send
+            self.storage.set_signal_status(signal_key, "EXECUTED", "found_in_mt5")
 
     # ------------------------------------------------------------ follow-ups
 
     async def _close(self, pos, volume: float) -> None:
         m = self.mt5
-        tick = await self.client.call("symbol_info_tick", pos.symbol)
+        tick = await self.client.read("symbol_info_tick", pos.symbol)
         buy_pos = pos.type == m.POSITION_TYPE_BUY
         si = await self.client.call("symbol_info", pos.symbol)
         req = {"action": m.TRADE_ACTION_DEAL, "symbol": pos.symbol, "position": pos.ticket, "volume": volume,
@@ -337,7 +431,7 @@ class Mt5Executor:
         for attempt in range(self.retry_attempts):
             res = await self.client.call("order_send", req)
             if res is not None and res.retcode in RETRY_FRESH_PRICE:
-                tick = await self.client.call("symbol_info_tick", pos.symbol)
+                tick = await self.client.read("symbol_info_tick", pos.symbol)
                 req["price"] = tick.bid if buy_pos else tick.ask
                 continue
             await self._check(res, f"close {pos.ticket}")
@@ -353,13 +447,39 @@ class Mt5Executor:
     async def _live_positions(self, signal_key: str) -> list:
         out = []
         for t in self.storage.trades_for_signal(signal_key, open_only=True):
-            found = await self.client.call("positions_get", ticket=int(t["trade_id"]))
+            found = await self.client.read("positions_get", ticket=int(t["trade_id"]))  # None raises: not "gone"
             if found:
                 out.append(found[0])
         return out
 
+    async def _reconcile_signal(self, signal_key: str) -> list[str]:
+        """Before acting on a follow-up: adopt what the signal's PENDING/SENT orders became since the last sync."""
+        done = []
+        for o in self.storage.orders_for_signal(signal_key):
+            if o["status"] == "PENDING" and o["oanda_order_id"]:
+                # hedging: a filled pending order keeps its ticket as the position ticket
+                pos = await self.client.read("positions_get", ticket=int(o["oanda_order_id"]))
+                if pos:
+                    self._adopt(o, pos[0])
+                    done.append(f"чакащата поръчка #{o['oanda_order_id']} вече е изпълнена ({pos[0].volume} лота)")
+            elif o["status"] == "SENT":
+                found = await self._find_by_tag(short_tag(o["client_id"]))
+                if found is None:
+                    continue  # MT5 answered and has nothing with this tag
+                kind, obj = found
+                if kind == "unknown":
+                    raise Mt5Error(f"{o['client_id']}: MT5 не отговаря, не знам дали поръчката съществува")
+                if kind == "order":
+                    self.storage.update_order(o["client_id"], status="PENDING", oanda_order_id=str(obj.ticket))
+                    self._signal_live(signal_key)
+                elif kind == "position":
+                    self._adopt(o, obj)
+                else:  # filled and closed again: sync() records the close
+                    self._adopt(o, NS(ticket=obj.position_id, volume=obj.volume, price_open=obj.price))
+        return done
+
     async def apply_follow_up(self, fu: FollowUp, signal_key: str, info: InstrumentInfo) -> list[str]:
-        done: list[str] = []
+        done = await self._reconcile_signal(signal_key)
         positions = await self._live_positions(signal_key)
         step = Decimal(1).scaleb(-info.trade_units_precision)
 
@@ -375,39 +495,70 @@ class Mt5Executor:
             for p in positions:
                 await self._close(p, p.volume)
                 done.append(f"затворена #{p.ticket} ({p.volume} лота)")
-            done += await self._cancel_pending(signal_key)
+            cancelled, filled = await self._cancel_pending(signal_key)
+            done += cancelled
+            for p in filled:  # filled while we tried to remove it
+                await self._close(p, p.volume)
+                done.append(f"затворена #{p.ticket} ({p.volume} лота)")
         elif fu.action is FollowUpAction.CLOSE_PARTIAL:
             for p in positions:
                 vol = (Decimal(str(p.volume)) * fu.fraction).quantize(step, rounding=ROUND_DOWN)
                 if vol < info.minimum_trade_size:
+                    done.append(f"пропусната #{p.ticket}: {p.volume} лота е твърде малко за частично затваряне")
                     continue
                 if Decimal(str(p.volume)) - vol < info.minimum_trade_size:
                     vol = Decimal(str(p.volume))
                 await self._close(p, float(vol))
                 done.append(f"затворени {vol} от {p.volume} лота (#{p.ticket})")
         elif fu.action is FollowUpAction.CANCEL:
-            done += await self._cancel_pending(signal_key)
+            cancelled, filled = await self._cancel_pending(signal_key)
+            done += cancelled
+            for p in positions + filled:  # never close on a "cancel": say plainly that it is open
+                done.append(f"⚠️ поръчката вече е изпълнена: позиция #{p.ticket} ({p.volume} лота) остава отворена "
+                            "със SL/TP, не я затварям автоматично")
         return done
 
-    async def _cancel_pending(self, signal_key: str) -> list[str]:
-        done = []
+    async def _cancel_pending(self, signal_key: str) -> tuple[list[str], list]:
+        """Remove the signal's pending orders. Returns (what was done, positions they turned into meanwhile)."""
+        m = self.mt5
+        done, filled = [], []
         for o in self.storage.orders_for_signal(signal_key):
             if o["status"] != "PENDING" or not o["oanda_order_id"]:
                 continue
-            res = await self.client.call("order_send", {"action": self.mt5.TRADE_ACTION_REMOVE,
-                                                        "order": int(o["oanda_order_id"])})
+            ticket = int(o["oanda_order_id"])
+            res = await self.client.call("order_send", {"action": m.TRADE_ACTION_REMOVE, "order": ticket})
             if res is not None and res.retcode == DONE:
                 self.storage.update_order(o["client_id"], status="CANCELLED")
-                done.append(f"отменена чакаща поръчка #{o['oanda_order_id']}")
-            elif not await self.client.call("orders_get", ticket=int(o["oanda_order_id"])):
-                self.storage.update_order(o["client_id"], status="CANCELLED")  # already gone (filled or expired)
+                done.append(f"отменена чакаща поръчка #{ticket}")
+                continue
+            # no answer or refused: find out where the order is before touching the DB (None reads raise)
+            what = f"cancel #{ticket}: {getattr(res, 'retcode', None)} {getattr(res, 'comment', '')}".strip()
+            if await self.client.read("orders_get", ticket=ticket):
+                raise Mt5Error(f"{what}: поръчката още е активна в MT5")
+            pos = await self.client.read("positions_get", ticket=ticket)  # filled: the position keeps the ticket
+            if pos:
+                self._adopt(o, pos[0])
+                filled.append(pos[0])
+                continue
+            hist = await self.client.read("history_orders_get", ticket=ticket)
+            state = hist[0].state if hist else None
+            if state in (m.ORDER_STATE_CANCELED, m.ORDER_STATE_EXPIRED, m.ORDER_STATE_REJECTED):
+                self.storage.update_order(o["client_id"], status="CANCELLED")
+                done.append(f"чакаща поръчка #{ticket} вече не е активна (отменена/изтекла)")
+            elif state == m.ORDER_STATE_FILLED:  # filled and closed again: sync() records the close
+                deal = next((d for d in await self.client.read("history_deals_get", position=ticket)
+                             if d.entry == m.DEAL_ENTRY_IN), None)
+                if deal is None:
+                    raise Mt5Error(f"{what}: изпълнена, но сделката още не е в историята")
+                self._adopt(o, NS(ticket=ticket, volume=deal.volume, price_open=deal.price))
+                done.append(f"чакаща поръчка #{ticket} е била изпълнена и вече затворена")
             else:
-                raise Mt5Error(f"cancel #{o['oanda_order_id']}: {getattr(res, 'retcode', None)}")
-        return done
+                raise Mt5Error(f"{what}: не знам какво е станало с поръчката, провери терминала")
+        return done, filled
 
     async def amend_levels(self, signal_key: str, sl: Decimal | None, tps: list[Decimal],
                            info: InstrumentInfo) -> list[str]:
-        done = []
+        done = await self._reconcile_signal(signal_key)
         part_by_ticket = {o["oanda_trade_id"]: o["part"] for o in self.storage.orders_for_signal(signal_key)}
         for p in await self._live_positions(signal_key):
             part = part_by_ticket.get(str(p.ticket), 0)
@@ -420,30 +571,52 @@ class Mt5Executor:
     # ------------------------------------------------------------ monitoring
 
     async def sync(self) -> tuple[list[dict], list[dict]]:
+        """Returns (adopted, closed). Adopted entries carry kind: filled | recovered | pending."""
         opened, closed = [], []
-        live = await self._positions()
+        try:
+            live = await self._positions()
+        except Mt5Error as e:  # MT5 can't be asked: this round proves nothing about what is open
+            logger.warning("mt5_sync_skipped", error=str(e))
+            return opened, closed
         by_tag = {p.comment: p for p in live}
-        live_tickets = {str(p.ticket) for p in live}
+        by_ticket = {str(p.ticket): p for p in live}
+        live_orders = None
 
         for o in self.storage.orders_with_status("PENDING", "SENT"):
-            p = by_tag.get(short_tag(o["client_id"]))
-            if p is None:
+            tag = short_tag(o["client_id"])
+            p = by_tag.get(tag) or by_ticket.get(o["oanda_order_id"] or "")
+            if p is not None:
+                self._adopt(o, p)
+                opened.append({"trade_id": str(p.ticket), "instrument": o["instrument"], "units": p.volume,
+                               "price": p.price_open, "signal_key": o["signal_key"],
+                               "kind": "filled" if o["status"] == "PENDING" else "recovered"})
                 continue
-            self.storage.update_order(o["client_id"], status="FILLED", oanda_trade_id=str(p.ticket))
-            sign = -1 if Decimal(o["units"]) < 0 else 1
-            self.storage.upsert_trade(str(p.ticket), o["signal_key"], o["client_id"], o["instrument"],
-                                      Decimal(str(p.volume)) * sign, Decimal(str(p.price_open)),
-                                      datetime.now(timezone.utc).isoformat())
-            opened.append({"trade_id": str(p.ticket), "instrument": o["instrument"], "units": p.volume,
-                           "price": p.price_open, "signal_key": o["signal_key"]})
+            if o["status"] != "SENT":
+                continue
+            if live_orders is None:  # a SENT row whose answer was lost may be a working pending order
+                try:
+                    live_orders = {x.comment: x for x in await self.client.read("orders_get")}
+                except Mt5Error:
+                    live_orders = {}
+            po = live_orders.get(tag)
+            if po is not None:
+                self.storage.update_order(o["client_id"], status="PENDING", oanda_order_id=str(po.ticket))
+                self._signal_live(o["signal_key"])
+                opened.append({"trade_id": str(po.ticket), "instrument": o["instrument"], "units": po.volume_current,
+                               "price": po.price_open, "signal_key": o["signal_key"], "kind": "pending"})
 
         for t in self.storage.open_trades():
-            if t["trade_id"] in live_tickets:
+            if t["trade_id"] in by_ticket:
                 continue
-            deals = await self.client.call("history_deals_get", position=int(t["trade_id"])) or ()
+            try:
+                deals = await self.client.read("history_deals_get", position=int(t["trade_id"]))
+            except Mt5Error:
+                continue  # try again next round
             outs = [d for d in deals if d.entry != self.mt5.DEAL_ENTRY_IN]
-            if not outs:
-                continue  # history not synced yet; try again next round
+            in_vol = sum(Decimal(str(d.volume)) for d in deals if d.entry == self.mt5.DEAL_ENTRY_IN)
+            out_vol = sum(Decimal(str(d.volume)) for d in outs)
+            if not outs or out_vol < (in_vol or abs(Decimal(t["units"]))):
+                continue  # history not synced yet, or only partly closed: still open
             pl = sum(Decimal(str(d.profit)) + Decimal(str(d.commission)) + Decimal(str(d.swap))
                      + Decimal(str(getattr(d, "fee", 0))) for d in deals)
             close_price = Decimal(str(outs[-1].price))

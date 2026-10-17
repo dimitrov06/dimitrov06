@@ -61,7 +61,12 @@ async def run(settings: Settings, secrets: Secrets) -> None:
 
     pipeline, client, notifier = build_pipeline(settings, secrets)
     if isinstance(client, Mt5Client):
-        await client.connect()  # also refuses a real account in paper mode and a demo account in live mode
+        try:  # also refuses a real account in paper mode, a demo account in live mode and a terminal that can't trade
+            await client.connect()
+        except Exception as e:
+            await notifier.send(f"❗ signal-copier не стартира: {e}")
+            await notifier.aclose()
+            raise
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGINT, os_signal.SIGTERM):

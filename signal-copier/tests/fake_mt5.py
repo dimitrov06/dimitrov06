@@ -1,10 +1,22 @@
-"""In-memory stand-in for the MetaTrader5 module (IC Markets-like symbols, hedging account)."""
+"""In-memory stand-in for the MetaTrader5 module (IC Markets-like symbols, hedging account).
+
+Faithful to the real package where the bot's safety depends on it:
+- calls never raise: on an IPC/terminal error they return None and last_error() says why
+  (`fail = {"positions_get": 1}`: the next call(s) fail; `ipc_down = True`: every call fails, nothing executes);
+- a position's ticket == identifier == its opening order's ticket, also when a pending order fills;
+- deal times are trade-server time (`server_offset`, IC Markets = UTC+3 in October) and
+  history_deals_get(date_from, date_to) filters on them; history_deals_get(position=) by position;
+- REMOVE / SLTP / close of an order or position that is gone answer with a retcode, never an exception.
+"""
 
 from __future__ import annotations
 
 import itertools
 import time
+from datetime import datetime
 from types import SimpleNamespace as NS
+
+INVALID_REQUEST = 10013
 
 
 class FakeMt5:
@@ -13,11 +25,14 @@ class FakeMt5:
     ORDER_TYPE_BUY_LIMIT, ORDER_TYPE_SELL_LIMIT, ORDER_TYPE_BUY_STOP, ORDER_TYPE_SELL_STOP = 2, 3, 4, 5
     ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN = 0, 1, 2
     ORDER_TIME_GTC, ORDER_TIME_SPECIFIED = 0, 2
+    ORDER_STATE_CANCELED, ORDER_STATE_FILLED, ORDER_STATE_REJECTED, ORDER_STATE_EXPIRED = 2, 4, 5, 6
     POSITION_TYPE_BUY, POSITION_TYPE_SELL = 0, 1
     DEAL_ENTRY_IN, DEAL_ENTRY_OUT = 0, 1
+    ACCOUNT_MARGIN_MODE_RETAIL_NETTING, ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 0, 2
 
-    def __init__(self, demo: bool = True):
+    def __init__(self, demo: bool = True, server_offset: int = 3 * 3600):
         self.demo = demo
+        self.server_offset = server_offset
         self.balance, self.equity = 10000.0, 10000.0
         self.symbols = {
             # name: (digits, volume_min, volume_step, tick_value, tick_size, filling_mode)
@@ -28,10 +43,41 @@ class FakeMt5:
         self.ticks = {"AUDUSD": (0.69400, 0.69402), "XAUUSD": (4479.50, 4479.80), "US30": (42000.0, 42002.0)}
         self.positions: dict[int, NS] = {}
         self.orders: dict[int, NS] = {}
+        self.history_orders: dict[int, NS] = {}
         self.deals: list[NS] = []
         self.sent: list[dict] = []
-        self.script: list[str] = []  # per order_send: "none" | "lost" (executes, returns None) | "requote" | "timeout"
+        # per order_send: "none" (not executed, returns None) | "lost" (executes, returns None) | "requote" |
+        # "timeout" (10012, never executes) | "timeout_late" / "none_late" (10012 / None now, executes on settle())
+        self.script: list[str] = []
+        self.late: list[dict] = []  # requests the trade server is still working on
+        self.fail: dict[str, int] = {}  # function name -> how many more calls return None (IPC timeout)
+        self.ipc_down = False
+        self.err = (1, "Success")
+        # terminal / account switches (Algo Trading button, investor password, netting account ...)
+        self.algo_trading, self.tradeapi_disabled, self.connected = True, False, True
+        self.account_trade_allowed, self.trade_expert = True, True
+        self.margin_mode = self.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
         self._ids = itertools.count(1000)
+
+    # --- IPC ---
+    def _down(self, name: str) -> bool:
+        if self.ipc_down:
+            self.err = (-10004, "No IPC connection")
+            return True
+        if self.fail.get(name):
+            self.fail[name] -= 1
+            self.err = (-10005, "IPC timeout")
+            return True
+        self.err = (1, "Success")
+        return False
+
+    def server_now(self) -> int:
+        return int(time.time()) + self.server_offset
+
+    def settle(self) -> None:
+        """The trade server finishes the requests that were still in flight ("*_late" script modes)."""
+        while self.late:
+            self._execute(self.late.pop(0))
 
     # --- terminal ---
     def initialize(self, **kw):
@@ -42,74 +88,127 @@ class FakeMt5:
         return True
 
     def last_error(self):
-        return (1, "fake")
+        return self.err
+
+    def terminal_info(self):
+        if self._down("terminal_info"):
+            return None
+        return NS(connected=self.connected, trade_allowed=self.algo_trading, tradeapi_disabled=self.tradeapi_disabled)
 
     def account_info(self):
+        if self._down("account_info"):
+            return None
         return NS(login=5100123, server="ICMarketsSC-Demo", balance=self.balance, equity=self.equity,
-                  currency="USD", trade_mode=0 if self.demo else 2)
+                  currency="USD", trade_mode=0 if self.demo else 2, trade_allowed=self.account_trade_allowed,
+                  trade_expert=self.trade_expert, margin_mode=self.margin_mode)
 
     def symbol_select(self, name, enable):
         return name in self.symbols
 
     def symbol_info(self, name):
-        if name not in self.symbols:
+        if self._down("symbol_info") or name not in self.symbols:
             return None
         d, vmin, step, tv, ts, fill = self.symbols[name]
         return NS(name=name, digits=d, volume_min=vmin, volume_step=step, volume_max=100.0,
                   trade_tick_value=tv, trade_tick_value_loss=tv, trade_tick_size=ts, filling_mode=fill)
 
     def symbol_info_tick(self, name):
+        if self._down("symbol_info_tick"):
+            return None
         bid, ask = self.ticks[name]
-        return NS(bid=bid, ask=ask, time=int(time.time()))
+        return NS(bid=bid, ask=ask, time=self.server_now())
 
     # --- queries ---
     def positions_get(self, symbol=None, ticket=None):
-        out = [p for p in self.positions.values()
-               if (symbol is None or p.symbol == symbol) and (ticket is None or p.ticket == ticket)]
-        return tuple(out)
+        if self._down("positions_get"):
+            return None
+        return tuple(p for p in self.positions.values()
+                     if (symbol is None or p.symbol == symbol) and (ticket is None or p.ticket == ticket))
 
     def orders_get(self, ticket=None):
+        if self._down("orders_get"):
+            return None
         return tuple(o for o in self.orders.values() if ticket is None or o.ticket == ticket)
 
-    def history_deals_get(self, *args, position=None):
-        return tuple(d for d in self.deals if position is None or d.position_id == position)
+    def history_orders_get(self, ticket=None):
+        if self._down("history_orders_get"):
+            return None
+        return tuple(o for o in self.history_orders.values() if ticket is None or o.ticket == ticket)
+
+    def history_deals_get(self, date_from=None, date_to=None, position=None):
+        if self._down("history_deals_get"):
+            return None
+        out = [d for d in self.deals if position is None or d.position_id == position]
+        if date_from is not None:  # the terminal compares the bounds with server-time deal stamps
+            lo, hi = (x.timestamp() if isinstance(x, datetime) else float(x) for x in (date_from, date_to))
+            out = [d for d in out if lo <= d.time <= hi]
+        return tuple(out)
 
     # --- trading ---
     def order_send(self, req):
         self.sent.append(dict(req))
+        if self._down("order_send"):
+            return None  # never reached the terminal
         mode = self.script.pop(0) if self.script else None
         if mode == "none":
             return None
         if mode == "requote":
             return NS(retcode=10004, comment="Requote", order=0, deal=0, volume=0, price=0)
-        if mode == "timeout":
-            return NS(retcode=10012, comment="Timeout", order=0, deal=0, volume=0, price=0)
+        if mode in ("timeout", "timeout_late"):
+            if mode == "timeout_late":
+                self.late.append(dict(req))
+            return NS(retcode=10012, comment="Request timeout", order=0, deal=0, volume=0, price=0)
+        if mode == "none_late":
+            self.late.append(dict(req))
+            self.err = (-10005, "IPC timeout")
+            return None
         res = self._execute(req)
-        return None if mode == "lost" else res
+        if mode == "lost":
+            self.err = (-10005, "IPC timeout")
+            return None
+        return res
+
+    def _deal(self, position_id: int, order: int, entry: int, price: float, volume: float, profit: float,
+              comment: str, magic: int) -> None:
+        self.deals.append(NS(ticket=next(self._ids), order=order, position_id=position_id, entry=entry, price=price,
+                             volume=volume, profit=profit, commission=-0.7, swap=0.0, fee=0.0,
+                             time=self.server_now(), comment=comment, magic=magic))
+
+    def _history_order(self, ticket: int, state: int, comment: str) -> None:
+        self.history_orders[ticket] = NS(ticket=ticket, state=state, comment=comment)
+
+    @staticmethod
+    def _refused(comment="Invalid request"):
+        return NS(retcode=INVALID_REQUEST, comment=comment, order=0, deal=0, volume=0, price=0)
 
     def _execute(self, req):
         a = req["action"]
+        if not self.algo_trading or self.tradeapi_disabled:
+            return NS(retcode=10027, comment="AutoTrading disabled by client", order=0, deal=0, volume=0, price=0)
         if a == self.TRADE_ACTION_DEAL and "position" in req:
-            p = self.positions[req["position"]]
+            p = self.positions.get(req["position"])
+            if p is None:
+                return self._refused("Position doesn't exist")
             vol = round(req["volume"], 2)
-            self.deals.append(NS(ticket=next(self._ids), position_id=p.ticket, entry=self.DEAL_ENTRY_OUT,
-                                 price=req["price"], volume=vol, profit=12.5 * vol / p.volume, commission=-0.7,
-                                 swap=0.0, fee=0.0, time=int(time.time()), comment=req.get("comment", "")))
+            order = next(self._ids)
+            self._history_order(order, self.ORDER_STATE_FILLED, req.get("comment", ""))
+            self._deal(p.ticket, order, self.DEAL_ENTRY_OUT, req["price"], vol, 12.5 * vol / p.volume,
+                       req.get("comment", ""), req.get("magic", 0))
             p.volume = round(p.volume - vol, 2)
             if p.volume <= 0:
                 del self.positions[p.ticket]
-            return NS(retcode=10009, comment="done", order=next(self._ids), deal=0, volume=vol, price=req["price"])
+            return NS(retcode=10009, comment="done", order=order, deal=0, volume=vol, price=req["price"])
         if a == self.TRADE_ACTION_DEAL:
             ticket = next(self._ids)
             buy = req["type"] == self.ORDER_TYPE_BUY
-            self.positions[ticket] = NS(ticket=ticket, symbol=req["symbol"], type=0 if buy else 1,
+            self.positions[ticket] = NS(ticket=ticket, identifier=ticket, symbol=req["symbol"], type=0 if buy else 1,
                                         volume=req["volume"], price_open=req["price"], sl=req["sl"],
                                         tp=req["tp"], magic=req["magic"], comment=req["comment"])
-            self.deals.append(NS(ticket=next(self._ids), position_id=ticket, entry=self.DEAL_ENTRY_IN,
-                                 price=req["price"], volume=req["volume"], profit=0.0, commission=-0.7, swap=0.0,
-                                 fee=0.0, time=int(time.time()), comment=req["comment"]))
-            return NS(retcode=10009, comment="done", order=ticket, deal=ticket + 1, volume=req["volume"],
-                      price=req["price"])
+            self._history_order(ticket, self.ORDER_STATE_FILLED, req["comment"])
+            self._deal(ticket, ticket, self.DEAL_ENTRY_IN, req["price"], req["volume"], 0.0, req["comment"],
+                       req["magic"])
+            return NS(retcode=10009, comment="done", order=ticket, deal=self.deals[-1].ticket,
+                      volume=req["volume"], price=req["price"])
         if a == self.TRADE_ACTION_PENDING:
             ticket = next(self._ids)
             self.orders[ticket] = NS(ticket=ticket, symbol=req["symbol"], type=req["type"],
@@ -118,27 +217,37 @@ class FakeMt5:
             return NS(retcode=10008, comment="placed", order=ticket, deal=0, volume=req["volume"],
                       price=req["price"])
         if a == self.TRADE_ACTION_SLTP:
-            p = self.positions[req["position"]]
+            p = self.positions.get(req["position"])
+            if p is None:
+                return self._refused("Position doesn't exist")
             p.sl, p.tp = req["sl"], req["tp"]
             return NS(retcode=10009, comment="done", order=0, deal=0, volume=0, price=0)
         if a == self.TRADE_ACTION_REMOVE:
-            self.orders.pop(req["order"])
+            o = self.orders.pop(req["order"], None)
+            if o is None:
+                return self._refused()
+            self._history_order(o.ticket, self.ORDER_STATE_CANCELED, o.comment)
             return NS(retcode=10009, comment="done", order=0, deal=0, volume=0, price=0)
         raise AssertionError(req)
 
+    # --- broker-side events ---
     def fill_pending(self, ticket: int) -> int:
+        """The pending order fills: the position keeps the order's ticket (hedging)."""
         o = self.orders.pop(ticket)
-        pt = next(self._ids)
-        self.positions[pt] = NS(ticket=pt, symbol=o.symbol, type=0 if o.type in (2, 4) else 1,
-                                volume=o.volume_current, price_open=o.price_open, sl=o.sl, tp=o.tp, magic=o.magic,
-                                comment=o.comment)
-        return pt
+        self.positions[ticket] = NS(ticket=ticket, identifier=ticket, symbol=o.symbol,
+                                    type=0 if o.type in (2, 4) else 1, volume=o.volume_current,
+                                    price_open=o.price_open, sl=o.sl, tp=o.tp, magic=o.magic, comment=o.comment)
+        self._history_order(ticket, self.ORDER_STATE_FILLED, o.comment)
+        self._deal(ticket, ticket, self.DEAL_ENTRY_IN, o.price_open, o.volume_current, 0.0, o.comment, o.magic)
+        return ticket
+
+    def expire_pending(self, ticket: int) -> None:
+        o = self.orders.pop(ticket)
+        self._history_order(ticket, self.ORDER_STATE_EXPIRED, o.comment)
 
     def hit_tp(self, ticket: int, price: float) -> None:
         p = self.positions.pop(ticket)
-        self.deals.append(NS(ticket=next(self._ids), position_id=ticket, entry=self.DEAL_ENTRY_OUT, price=price,
-                             volume=p.volume, profit=45.0, commission=-0.7, swap=0.0, fee=0.0,
-                             time=int(time.time()), comment="[tp]"))
+        self._deal(ticket, next(self._ids), self.DEAL_ENTRY_OUT, price, p.volume, 45.0, "[tp]", p.magic)
 
     def market_sends(self) -> list[dict]:
         return [r for r in self.sent if r["action"] == self.TRADE_ACTION_DEAL and "position" not in r]

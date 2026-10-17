@@ -39,6 +39,11 @@ async def _check(settings, secrets) -> None:
             a = await client.account_summary()
             print(f"MT5 ok: {acc['login']} @ {acc['server']} ({'demo' if acc['demo'] else 'REAL'}), "
                   f"balance {a['balance']} {a['currency']}, equity {a['NAV']}")
+            blockers = await client.trade_blockers()  # paper/live: connect() already refused these
+            if blockers is None or blockers:
+                print(f"  trading BLOCKED: {'; '.join(blockers) if blockers else 'MT5 did not answer'}")
+            else:
+                print("  trading: allowed (Algo Trading on, hedging account)")
             for inst in ("XAU_USD", "EUR_USD", "US30_USD"):
                 try:
                     bid, ask, _ = await client.pricing(inst)
@@ -75,7 +80,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "login":
         asyncio.run(_login(settings, secrets))
     elif args.command == "check":
-        asyncio.run(_check(settings, secrets))
+        try:
+            asyncio.run(_check(settings, secrets))
+        except ConfigError as e:
+            print(f"config error: {e}", file=sys.stderr)
+            return 2
     else:
         from signal_copier.app import run
 

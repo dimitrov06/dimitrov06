@@ -38,6 +38,7 @@ class ExecResult:
     opened: list[dict] = field(default_factory=list)  # {"trade_id", "units", "price", "tp"}
     pending: list[dict] = field(default_factory=list)  # {"order_id", "units", "price", "tp"}
     skipped: list[str] = field(default_factory=list)  # already sent earlier
+    unknown: list[str] = field(default_factory=list)  # may exist at the broker: never resent, reconciled later
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -179,6 +180,7 @@ class Executor:
                                    "tp": tp})
         elif state == "UNKNOWN":
             self.storage.update_order(cid, status="SENT")
+            result.unknown.append(cid)
             result.errors.append(f"{cid}: state unknown after network error, check OANDA")
         else:
             self.storage.update_order(cid, status="CANCELLED", oanda_order_id=order.get("id"), response=order)

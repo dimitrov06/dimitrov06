@@ -23,6 +23,8 @@ from signal_copier.storage import Storage
 logger = log.get("pipeline")
 
 DONE = ("EXECUTED", "RECORDED")
+# applying these twice does no harm, so a FAILED one may run again when the channel edits the message
+RETRYABLE = (FollowUpAction.MOVE_SL_BE, FollowUpAction.MOVE_SL, FollowUpAction.CLOSE, FollowUpAction.CANCEL)
 
 
 def _fmt_signal(s: Signal) -> str:
@@ -68,6 +70,7 @@ class Pipeline:
         self.executor = executor
         self.clock = clock
         self._lock = asyncio.Lock()
+        self._trade_blocked = ""  # last reason MT5 could not trade, notified once per change
 
     # ------------------------------------------------------------- state
 
@@ -183,10 +186,12 @@ class Pipeline:
                                data={"units": decision.units, "entry": decision.entry_price,
                                      "risk_amount": decision.risk_amount})
         result = await self.executor.open_signal(s, decision, info)
-        status = "EXECUTED" if (result.opened or result.pending or result.skipped) else "FAILED"
+        # an order in unknown state may be live at the broker: keep the signal manageable (Close/BE/edits)
+        status = "EXECUTED" if (result.opened or result.pending or result.skipped or result.unknown) else "FAILED"
         self.storage.set_signal_status(s.key, status, "; ".join(result.errors) or None)
         self.storage.add_event("execute", status, "; ".join(result.errors) or None, signal_key=s.key,
-                               data={"opened": result.opened, "pending": result.pending, "skipped": result.skipped})
+                               data={"opened": result.opened, "pending": result.pending, "skipped": result.skipped,
+                                     "unknown": result.unknown})
         lines = [f"✅ Отворена {s.symbol} {s.side.value}: trade {o['trade_id']}, {o['units']} units @ {o['price']},"
                  f" TP {o['tp']}" for o in result.opened]
         lines += [f"⏳ Чакаща поръчка {s.symbol}: {o['units']} units @ {o['price']}, TP {o['tp']}"
@@ -229,11 +234,11 @@ class Pipeline:
         if old_sl == s.sl and old_tps == s.tp:
             self.storage.add_event("edit", "NO_CHANGE", signal_key=s.key)
             return
-        self.storage.update_signal_levels(s.key, s.sl, s.tp)
         done: list[str] = []
         if self.mode is not Mode.RECORD and existing["status"] == "EXECUTED":
             info = await self.client.instrument(s.symbol)
-            done = await self.executor.amend_levels(s.key, s.sl, s.tp, info)
+            done = await self.executor.amend_levels(s.key, s.sl, s.tp, info)  # raises: DB keeps the old levels
+        self.storage.update_signal_levels(s.key, s.sl, s.tp)
         self.storage.add_event("edit", "AMENDED", signal_key=s.key,
                                data={"sl": s.sl, "tp": s.tp, "actions": done})
         await self.notifier.send(
@@ -263,9 +268,12 @@ class Pipeline:
 
     async def handle_follow_up(self, fu: FollowUp) -> None:
         fkey = self.storage.follow_up_key(fu)
-        if self.storage.get_follow_up(fkey):
+        prev = self.storage.get_follow_up(fkey)
+        if prev and not (prev["status"] == "FAILED" and fu.action in RETRYABLE):
             self.storage.add_event("follow_up", "DUPLICATE", message_key=fkey)
             return  # e.g. the channel edited its "close" message: never close twice
+        if prev:
+            self.storage.add_event("follow_up", "RETRY", prev["reason"], message_key=fkey)
         target, problem = self._resolve_target(fu)
         if target is None:
             self.storage.save_follow_up(fu, None, "REJECTED", problem)
@@ -307,15 +315,40 @@ class Pipeline:
             return
         opened, closed = await self.executor.sync()
         for t in opened:
-            await self.notifier.send(f"✅ Изпълнена чакаща поръчка {t['instrument']}: {t['units']} @ {t['price']}")
+            kind = t.get("kind", "filled")
+            if kind == "recovered":
+                text = (f"✅ Поръчката без отговор е изпълнена в MT5: {t['instrument']} trade {t['trade_id']}, "
+                        f"{t['units']} @ {t['price']}. Ботът я управлява.")
+            elif kind == "pending":
+                text = (f"⏳ Поръчката без отговор е чакаща в MT5: {t['instrument']} #{t['trade_id']}, "
+                        f"{t['units']} @ {t['price']}. Ботът я управлява.")
+            else:
+                text = f"✅ Изпълнена чакаща поръчка {t['instrument']}: {t['units']} @ {t['price']}"
+            await self.notifier.send(text)
         for t in closed:
             await self.notifier.send(
                 f"🏁 Затворена {t['instrument']} trade {t['trade_id']} @ {t['close_price']}, P/L {t['realized_pl']}"
             )
+        await self._check_trade_allowed()
         account = await self.client.account_summary()
         nav = Decimal(account["NAV"])
         if self.risk.daily_loss_hit(nav, self._day_start_nav(nav)):
             await self._halt_for_today()
+
+    async def _check_trade_allowed(self) -> None:
+        """MT5: tell the owner once when the terminal stops being able to trade (Algo Trading off ...) and back."""
+        blockers_fn = getattr(self.client, "trade_blockers", None)
+        if blockers_fn is None:
+            return
+        blockers = await blockers_fn()
+        if blockers is None:
+            return  # MT5 did not answer: account_summary below reports it
+        blocked = "; ".join(blockers)
+        if blocked != self._trade_blocked:
+            self._trade_blocked = blocked
+            self.storage.add_event("mt5", "TRADE_BLOCKED" if blocked else "TRADE_ALLOWED", blocked or None)
+            await self.notifier.send(f"🚫 MT5 не може да търгува: {blocked}. Новите сигнали и командите ще се "
+                                     "отказват, докато не го оправиш." if blocked else "✅ MT5 отново може да търгува.")
 
     async def handle_command(self, cmd: str) -> str:
         """/help, /start, /commands and anything unknown return HELP_TEXT."""
