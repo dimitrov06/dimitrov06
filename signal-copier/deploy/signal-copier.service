@@ -1,0 +1,19 @@
+# systemd unit: keeps the docker compose stack running and restarts it on boot.
+# Install: sudo cp deploy/signal-copier.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#          sudo systemctl enable --now signal-copier
+[Unit]
+Description=signal-copier (Telegram -> OANDA)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/signal-copier
+ExecStart=/usr/bin/docker compose up --build
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

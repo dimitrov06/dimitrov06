@@ -1,0 +1,72 @@
+# Copy to config.yaml. Secrets go in .env, never here.
+
+mode: record            # record | paper | live
+broker: mt5             # mt5 (IC Markets MetaTrader 5) | oanda
+
+mt5:
+  # parser instrument -> IC Markets symbol. Anything not listed: XAU_USD -> XAUUSD, EUR_USD -> EURUSD
+  symbol_map:
+    US30_USD: US30
+    NAS100_USD: USTEC
+    SPX500_USD: US500
+    DE30_EUR: DE40
+    UK100_GBP: UK100
+    WTICO_USD: XTIUSD
+    BCO_USD: XBRUSD
+  symbol_suffix: ""     # set if your account's symbols have a suffix
+  magic: 770077         # marks the bot's positions in MT5
+  deviation_points: 20  # max slippage on market orders, in points
+
+telegram:
+  channels:             # @username, numeric id (-100...) or the group name as shown in Telegram
+    - "@example_signals"
+  session_name: signal_copier
+  session_dir: data       # Telethon session file lives here (keep it secret, it is your login)
+
+parser:
+  rules_file: null      # null = built-in src/signal_copier/parser/rules.yaml. A custom file must be a copy of the
+                        # current built-in one: a file without its command/update sections is refused at start
+  # How to treat "XAUUSD BUY 2345" (price/zone without LIMIT/STOP word):
+  # market = open at market now, the price is only a reference for risk checks
+  bare_price_entry: market   # market | limit
+  max_price_deviation_pct: 10   # SL/TP further than this from entry => not confident
+
+risk:
+  risk_per_trade_pct: 0.5
+  max_open_positions: 5
+  count_pending_in_max_open: false      # false = only open positions count; pending LIMIT/STOP orders do not
+                                        # (one that fills later can take the count above max_open_positions)
+  max_positions_per_symbol: 2           # always counts pending orders too
+  daily_loss_limit_pct: 2.0             # reached: no new trades until tomorrow (UTC), pending orders cancelled
+  cap_to_daily_budget: true             # a new trade risks at most what is left of the daily limit
+  max_entry_slippage_sl_fraction: 0.3   # reject if price moved > 30% of SL distance
+  late_entry_min_sl_fraction: 0.33      # adverse late entry: size as if SL >= 33% of the channel's SL distance
+  max_signal_age_seconds: 60            # counted from the post, also when the channel edits it later
+  max_spread:                            # in price units, keyed by parser instrument name
+    XAU_USD: 0.50
+    EUR_USD: 0.00025
+    US30_USD: 4.0
+    NAS100_USD: 2.5
+  default_max_spread_sl_fraction: 0.15  # fallback: spread <= 15% of SL distance
+  commission_per_lot: 0                 # round-turn commission per lot in account currency (Raw account ~5.5 EUR)
+  max_lots: {}                          # per instrument, bigger sizes are rejected, e.g. {XAU_USD: 1.0}
+
+executor:
+  tp_split: last        # last = one trade, TP = last TP (RTED manual: TP2 is the target, TP1 is only watched)
+                        # equal = one trade per TP, size split equally
+  retry_attempts: 4
+  retry_base_delay_s: 1.0
+  request_timeout_s: 10
+  pending_order_expiry_minutes: 240   # LIMIT/STOP orders expire after this
+  unknown_order_expiry_minutes: 10   # MT5: an order without answer that MT5 shows nowhere this long (all reads
+                                     # answered, terminal connected) is taken as never executed, frees its slot
+  follow_up_symbol_lookback_hours: 24 # record mode: "AUDUSD close" without reply -> AUDUSD signal in this window
+                                      # (paper/live: the one AUDUSD trade still open or pending, however old)
+  monitor_interval_s: 30              # how often closed trades / filled limits are checked
+
+storage:
+  sqlite_path: data/signal_copier.sqlite
+
+logging:
+  level: INFO
+  json: true

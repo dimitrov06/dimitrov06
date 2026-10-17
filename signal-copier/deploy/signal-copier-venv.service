@@ -1,0 +1,16 @@
+# Alternative without Docker: runs from a virtualenv in /opt/signal-copier/.venv
+[Unit]
+Description=signal-copier (Telegram -> OANDA, venv)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/signal-copier
+ExecStart=/opt/signal-copier/.venv/bin/python -m signal_copier run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
