@@ -1,0 +1,12 @@
+services:
+  signal-copier:
+    build: .
+    image: signal-copier:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
