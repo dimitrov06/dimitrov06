@@ -10,7 +10,7 @@ import pytest
 
 from conftest import NOW
 from fake_mt5 import FakeMt5
-from signal_copier.executor.mt5 import Mt5Client, Mt5Executor
+from signal_copier.executor.mt5 import Mt5Client, Mt5Error, Mt5Executor
 from signal_copier.models import IncomingMessage
 from signal_copier.notifier import Notifier
 from signal_copier.parser import SignalParser
@@ -232,12 +232,12 @@ def test_close_during_ipc_outage_alerts_and_an_edit_retries_it():
     fake, p = _open_audusd()
     fake.ipc_down = True
     run(p.handle_message(msg(AUDUSD_CLOSE, 502, reply_to=501)))
-    assert p.storage.get_follow_up("-1001:502:CLOSE")["status"] == "FAILED"
+    assert p.storage.get_follow_up("-1001:502:CLOSE:AUD_USD")["status"] == "FAILED"
     assert p.notifier.sent[-1].startswith("❗") and NOTHING_OPEN not in p.notifier.sent[-1]
     fake.ipc_down = False
     run(p.handle_message(msg(AUDUSD_CLOSE + " ✅", 502, reply_to=501, edited=True)))
     assert fake.positions == {}
-    assert p.storage.get_follow_up("-1001:502:CLOSE")["status"] == "EXECUTED"
+    assert p.storage.get_follow_up("-1001:502:CLOSE:AUD_USD")["status"] == "EXECUTED"
     run(p.handle_message(msg(AUDUSD_CLOSE + " ✅✅", 502, reply_to=501, edited=True)))  # done: never again
     assert len([r for r in fake.sent if "position" in r]) == 1
 
@@ -377,7 +377,7 @@ def test_cancel_during_ipc_outage_keeps_order_pending_and_alerts():
     run(p.handle_message(msg(XAUUSD_CANCEL, 1523, reply_to=1522)))
     fake.ipc_down = False
     assert statuses(p, "-1001:1522:0") == ["PENDING"] and ticket in fake.orders
-    assert p.storage.get_follow_up("-1001:1523:CANCEL")["status"] == "FAILED"
+    assert p.storage.get_follow_up("-1001:1523:CANCEL:XAU_USD")["status"] == "FAILED"
     assert p.notifier.sent[-1].startswith("❗")
     fake.fill_pending(ticket)
     run(p.monitor_once())  # still tracked: adopted when it fills
@@ -389,7 +389,7 @@ def test_cancel_whose_remove_answer_is_lost_checks_history():
     fake.script = ["lost"]  # REMOVE executes, the answer is lost
     run(p.handle_message(msg(XAUUSD_CANCEL, 1523, reply_to=1522)))
     assert fake.orders == {} and statuses(p, "-1001:1522:0") == ["CANCELLED"]
-    assert p.storage.get_follow_up("-1001:1523:CANCEL")["status"] == "EXECUTED"
+    assert p.storage.get_follow_up("-1001:1523:CANCEL:XAU_USD")["status"] == "EXECUTED"
 
 
 def test_cancel_whose_remove_never_arrived_is_an_error():
@@ -397,7 +397,7 @@ def test_cancel_whose_remove_never_arrived_is_an_error():
     fake.script = ["none"]  # REMOVE never reached the server
     run(p.handle_message(msg(XAUUSD_CANCEL, 1523, reply_to=1522)))
     assert ticket in fake.orders and statuses(p, "-1001:1522:0") == ["PENDING"]
-    assert p.storage.get_follow_up("-1001:1523:CANCEL")["status"] == "FAILED"
+    assert p.storage.get_follow_up("-1001:1523:CANCEL:XAU_USD")["status"] == "FAILED"
 
 
 def test_move_be_between_fill_and_sync_is_applied():
@@ -434,7 +434,7 @@ def test_symbol_only_close_with_an_unknown_second_signal_is_ambiguous():
     run(p.monitor_once())
     assert len(fake.positions) == 2
     run(p.handle_message(msg("Close XAUUSD now", 610)))
-    fu = p.storage.get_follow_up("-1001:610:CLOSE")
+    fu = p.storage.get_follow_up("-1001:610:CLOSE:XAU_USD")
     assert (fu["status"], fu["reason"]) == ("REJECTED", "ambiguous_target") and len(fake.positions) == 2
 
 
@@ -447,6 +447,7 @@ def test_sync_revives_a_failed_signal_whose_order_turns_up():
     fake.ipc_down = False
     run(p.monitor_once())
     assert p.storage.get_signal("-1001:620:0")["status"] == "EXECUTED"
+    fake.ticks["AUDUSD"] = (0.69450, 0.69452)  # TP1 0.69446 reached
     run(p.handle_message(msg("TP1 hit ✅ move SL to BE", 621, reply_to=620)))
     (pos,) = fake.positions.values()
     assert pos.sl == pos.price_open
@@ -469,7 +470,6 @@ def test_cancel_reaches_a_pending_order_still_in_unknown_state():
 @pytest.mark.parametrize("attr,value,reason", [
     ("algo_trading", False, "Algo Trading"),
     ("tradeapi_disabled", True, "Python API"),
-    ("connected", False, "няма връзка"),
     ("account_trade_allowed", False, "investor"),
     ("trade_expert", False, "брокерът"),
     ("margin_mode", FakeMt5.ACCOUNT_MARGIN_MODE_RETAIL_NETTING, "hedging"),
@@ -480,6 +480,22 @@ def test_connect_refuses_a_terminal_or_account_that_cannot_trade(attr, value, re
     client = Mt5Client(Mt5Credentials(expect_demo=False), owner_settings().mt5, mt5_module=fake)
     with pytest.raises(ConfigError, match=reason):
         run(client.connect())
+
+
+@pytest.mark.parametrize("setup", ["not_connected", "no_answer"])
+def test_connect_to_a_terminal_still_starting_is_refused_but_retryable(setup):
+    """At boot the terminal answers before it has reached the broker: refused, but not a fatal config error,
+    so the restart loop in __main__ tries again (C19 fatal-error-exits-process-no-restart-on-windows)."""
+    fake = FakeMt5(demo=False)
+    if setup == "not_connected":
+        fake.connected = False
+    else:
+        fake.fail = {"terminal_info": 1}
+    client = Mt5Client(Mt5Credentials(expect_demo=False), owner_settings().mt5, mt5_module=fake)
+    with pytest.raises(Mt5Error, match="още не може да търгува") as e:
+        run(client.connect())
+    assert not isinstance(e.value, ConfigError)
+    assert fake.sent == []
 
 
 def test_check_reports_blocked_trading(monkeypatch, capsys):

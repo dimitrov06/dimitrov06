@@ -33,6 +33,10 @@ def client_id(s: Signal, part: int) -> str:
     return f"sc_{str(s.chat_id).replace('-', 'n')}_{s.message_id}_{s.index}_{part}"
 
 
+class Waiting(str):
+    """A follow-up result line that means "not applied yet, try again later" (BE while price is behind entry)."""
+
+
 @dataclass
 class ExecResult:
     opened: list[dict] = field(default_factory=list)  # {"trade_id", "units", "price", "tp"}
@@ -78,8 +82,11 @@ class Executor:
                     if found is not None:
                         self._record_lookup(s, cid, found, units * sign, tp, result)
                         continue
-                else:
-                    result.skipped.append(cid)  # done, rejected or failed earlier: never resend automatically
+                elif existing["status"] in ("FILLED", "PENDING"):
+                    result.skipped.append(cid)  # done earlier
+                    continue
+                else:  # rejected, cancelled or failed earlier: never resend automatically
+                    result.errors.append(f"{cid}: {existing['status']} по-рано, не я пращам отново")
                     continue
             order = self._order_body(s, cid, units * sign, price, tp, info)
             await self._send(s, cid, order, units * sign, tp, result)

@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS signals_msg ON signals (chat_id, message_id);
 CREATE INDEX IF NOT EXISTS signals_symbol ON signals (chat_id, symbol, date);
 CREATE TABLE IF NOT EXISTS follow_ups (
-    key TEXT PRIMARY KEY,          -- chat:message:action
+    key TEXT PRIMARY KEY,          -- chat:message:action[:symbol]
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
     action TEXT NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
     fraction TEXT,
     tp_index INTEGER,
     date TEXT NOT NULL,
-    status TEXT NOT NULL,          -- RECORDED | EXECUTED | REJECTED | FAILED
+    status TEXT NOT NULL,          -- RECORDED | EXECUTED | WAITING | REJECTED | FAILED
     reason TEXT,
     created_at TEXT NOT NULL
 );
@@ -166,6 +166,17 @@ class Storage:
         row = self.conn.execute("SELECT MAX(message_id) FROM messages WHERE chat_id=?", (chat_id,)).fetchone()
         return row[0]
 
+    def message_reply_to(self, chat_id: int, message_id: int) -> int | None:
+        """The message this one replies to (None if not stored or not a reply)."""
+        row = self._one("SELECT reply_to_msg_id FROM messages WHERE chat_id=? AND message_id=? ORDER BY id DESC"
+                        " LIMIT 1", chat_id, message_id)
+        return row["reply_to_msg_id"] if row else None
+
+    def message_posted_at(self, chat_id: int, message_id: int) -> datetime | None:
+        """When the message was first seen with its post date (edits never move it later)."""
+        row = self._one("SELECT MIN(date) AS d FROM messages WHERE chat_id=? AND message_id=?", chat_id, message_id)
+        return datetime.fromisoformat(row["d"]) if row and row["d"] else None
+
     # --------------------------------------------------------------- signals
 
     def get_signal(self, key: str) -> dict | None:
@@ -173,6 +184,16 @@ class Storage:
 
     def signals_for_message(self, chat_id: int, message_id: int) -> list[dict]:
         return self._all("SELECT * FROM signals WHERE chat_id=? AND message_id=? ORDER BY idx", chat_id, message_id)
+
+    def open_signals_for_symbol(self, chat_id: int, symbol: str) -> list[dict]:
+        """Traded signals on this symbol that still have an open trade or a pending/unknown order."""
+        return self._all(
+            "SELECT * FROM signals WHERE chat_id=? AND symbol=? AND status IN ('EXECUTED','RECORDED') AND key IN"
+            " (SELECT signal_key FROM trades WHERE state='OPEN'"
+            "  UNION SELECT signal_key FROM orders WHERE status IN ('PENDING','SENT'))"
+            " ORDER BY date DESC",
+            chat_id, symbol,
+        )
 
     def recent_signals_for_symbol(self, chat_id: int, symbol: str, since: datetime) -> list[dict]:
         return self._all(
@@ -208,8 +229,13 @@ class Storage:
     # ------------------------------------------------------------ follow-ups
 
     @staticmethod
-    def follow_up_key(fu: FollowUp) -> str:
-        return f"{fu.chat_id}:{fu.message_id}:{fu.action.value}"
+    def follow_up_key(fu: FollowUp, legacy: bool = False) -> str:
+        """One per message, action and symbol ("Close AUDUSD" + "Close XAUUSD" in one message are two).
+
+        legacy: the key used before the symbol was part of it (rows written by older versions).
+        """
+        key = f"{fu.chat_id}:{fu.message_id}:{fu.action.value}"
+        return key if legacy or fu.symbol is None else f"{key}:{fu.symbol}"
 
     def get_follow_up(self, key: str) -> dict | None:
         return self._one("SELECT * FROM follow_ups WHERE key=?", key)
@@ -219,10 +245,16 @@ class Storage:
             """INSERT INTO follow_ups (key, chat_id, message_id, action, signal_key, price, fraction, tp_index, date,
                    status, reason, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(key) DO UPDATE SET signal_key=excluded.signal_key, status=excluded.status,
-                   reason=excluded.reason""",
+                   reason=excluded.reason, price=excluded.price, fraction=excluded.fraction""",
             (self.follow_up_key(fu), fu.chat_id, fu.message_id, fu.action.value, signal_key, _s(fu.price),
              _s(fu.fraction), fu.tp_index, fu.date.isoformat(), status, reason, _now()),
         )
+
+    def update_follow_up(self, key: str, status: str, reason: str | None = None) -> None:
+        self.conn.execute("UPDATE follow_ups SET status=?, reason=? WHERE key=?", (status, reason, key))
+
+    def follow_ups_with_status(self, status: str) -> list[dict]:
+        return self._all("SELECT * FROM follow_ups WHERE status=? ORDER BY created_at", status)
 
     # ---------------------------------------------------------------- orders
 
@@ -308,11 +340,16 @@ class Storage:
                 (key, value),
             )
 
-    def open_positions(self) -> list[dict]:
-        """One row per signal that still has an open trade or a pending order."""
+    def open_positions(self, include_pending: bool = True) -> list[dict]:
+        """One row per signal that still has an open trade or a pending order.
+
+        include_pending=False leaves out confirmed pending LIMIT/STOP orders; an order in unknown state (SENT)
+        still counts, it may be an open position.
+        """
+        orders = "('PENDING','SENT')" if include_pending else "('SENT')"
         return self._all(
             "SELECT signal_key, instrument FROM trades WHERE state='OPEN'"
-            " UNION SELECT signal_key, instrument FROM orders WHERE status IN ('PENDING','SENT')"
+            f" UNION SELECT signal_key, instrument FROM orders WHERE status IN {orders}"
         )
 
     def signal_counts_since(self, since: datetime) -> dict[str, int]:

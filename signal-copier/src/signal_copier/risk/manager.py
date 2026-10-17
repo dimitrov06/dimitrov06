@@ -17,6 +17,7 @@ class InstrumentInfo:
     trade_units_precision: int  # decimals in units (0 for FX)
     minimum_trade_size: Decimal
     pip_location: int = -4
+    maximum_trade_size: Decimal | None = None  # MT5 volume_max
 
 
 @dataclass
@@ -42,6 +43,7 @@ class RiskDecision:
     units: Decimal = Decimal(0)  # absolute size; sign comes from side
     entry_price: Decimal | None = None
     sl_distance: Decimal | None = None
+    size_distance: Decimal | None = None  # SL distance the size was computed for (>= sl_distance)
     risk_amount: Decimal | None = None
     halt: bool = False  # daily loss limit reached -> stop trading until tomorrow
 
@@ -94,28 +96,47 @@ class RiskManager:
             return RiskDecision.reject(f"spread_too_wide:{spread}>{max_spread}")
 
         if market:
-            if (buy and fill <= s.sl) or (not buy and fill >= s.sl):
+            # the position closes on the other side of the spread (a buy at the bid): it must be before the SL too
+            if (buy and ctx.bid <= s.sl) or (not buy and ctx.ask >= s.sl):
                 return RiskDecision.reject("price_beyond_sl")
             if s.tp and ((buy and fill >= s.tp[0]) or (not buy and fill <= s.tp[0])):
                 return RiskDecision.reject("price_beyond_tp1")
             ref = s.entry.reference_price
             if ref is not None:
                 # Only a move in the trade's favour (towards TP) counts. A move against it, still before the
-                # SL, is a better entry with a tighter SL; the size below adapts so the risk stays the same.
+                # SL, is a better entry with a tighter SL; the size below adapts so the risk stays the same
+                # (up to late_entry_min_sl_fraction: beyond that the size stops growing and the risk shrinks).
                 best = (s.entry.zone_high if buy else s.entry.zone_low) if s.entry.is_zone else ref
                 moved = max(fill - best if buy else best - fill, Decimal(0))
                 allowed = abs(ref - s.sl) * cfg.max_entry_slippage_sl_fraction
                 if moved > allowed:
                     return RiskDecision.reject(f"price_moved_too_far:{moved}>{allowed}")
 
-        risk_amount = ctx.balance * cfg.risk_per_trade_pct / 100
-        loss_per_unit = sl_distance * ctx.quote_to_home
+        size_distance = sl_distance
+        if market and s.entry.reference_price is not None:
+            # an adverse late entry with the SL a few points away must not multiply the lot size
+            size_distance = max(sl_distance, abs(s.entry.reference_price - s.sl) * cfg.late_entry_min_sl_fraction)
+
+        # a floating loss makes the account smaller: 3% of what is really there
+        risk_amount = min(ctx.balance, ctx.nav) * cfg.risk_per_trade_pct / 100
+        capped = False
+        if cfg.cap_to_daily_budget and ctx.day_start_nav > 0:
+            # what is left of today's loss limit (realized + floating loss so far)
+            budget_left = max(ctx.day_start_nav * cfg.daily_loss_limit_pct / 100
+                              - max(ctx.day_start_nav - ctx.nav, Decimal(0)), Decimal(0))
+            capped = budget_left < risk_amount
+            risk_amount = min(risk_amount, budget_left)
+        loss_per_unit = size_distance * ctx.quote_to_home + cfg.commission_per_lot
         quantum = Decimal(1).scaleb(-ctx.instrument.trade_units_precision)
         units = (risk_amount / loss_per_unit).quantize(quantum, rounding=ROUND_DOWN)
         if units < ctx.instrument.minimum_trade_size:
-            return RiskDecision.reject("position_too_small")
+            return RiskDecision.reject(f"daily_risk_budget:{risk_amount:.2f}" if capped else "position_too_small")
+        limits = [x for x in (ctx.instrument.maximum_trade_size, cfg.max_lots.get(s.symbol)) if x is not None]
+        if limits and units > min(limits):
+            return RiskDecision.reject(f"position_too_large:{units}>{min(limits)}")
         return RiskDecision(
-            approved=True, units=units, entry_price=entry_price, sl_distance=sl_distance, risk_amount=risk_amount
+            approved=True, units=units, entry_price=entry_price, sl_distance=sl_distance,
+            size_distance=size_distance, risk_amount=risk_amount,
         )
 
 

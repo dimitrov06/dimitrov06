@@ -48,12 +48,13 @@ def test_notifier_never_raises_on_network_error():
     assert n.sent == ["hello"]
 
 
-def test_to_incoming_uses_edit_date_for_edits():
-    m = SimpleNamespace(id=7, raw_text="XAUUSD BUY", date=NOW, edit_date=NOW + timedelta(minutes=1),
+def test_to_incoming_keeps_the_post_date_for_edits():
+    """The age check counts from the post: an edit hours later must not make an old signal look fresh."""
+    m = SimpleNamespace(id=7, raw_text="XAUUSD BUY", date=NOW, edit_date=NOW + timedelta(hours=2),
                         reply_to=SimpleNamespace(reply_to_msg_id=3))
     new = to_incoming(-100, m, edited=False)
     edit = to_incoming(-100, m, edited=True)
-    assert new.date == NOW and edit.date == NOW + timedelta(minutes=1)
+    assert new.date == NOW and edit.date == NOW
     assert edit.edited and edit.reply_to_msg_id == 3 and edit.chat_id == -100
 
 
@@ -64,6 +65,11 @@ def test_channel_found_by_group_name():
              ("mom", "Мама")]
     assert match_title("RTED Investing - Premium Trading Signals SP", chats) == "rted"
     assert match_title("rted investing premium trading signals", chats) == "rted"
+    # a title that is only a piece of the wanted name never matches (the group was renamed, a contact "Al")
+    renamed = [("rted", "RTED VIP Gold & Forex Signals 🏆"), ("al", "Al"), ("ts", "Trading Signals"),
+               ("free", "RTED Investing")]
+    with pytest.raises(ValueError, match="no chat"):
+        match_title("RTED Investing - Premium Trading Signals SP", renamed)
     with pytest.raises(ValueError, match="ambiguous"):
         match_title("RTED Investing", chats)
     with pytest.raises(ValueError, match="no chat"):

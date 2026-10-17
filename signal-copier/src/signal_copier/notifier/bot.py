@@ -13,10 +13,15 @@ logger = log.get("notifier")
 
 CommandHandler = Callable[[str], Awaitable[str]]
 COMMANDS = ("/stop", "/resume", "/status", "/help", "/start", "/commands")
+SEND_TIMEOUT_S = 10  # one sendMessage; getUpdates long-polls 30 s on the client's longer timeout
+DRAIN_TIMEOUT_S = 15  # aclose() waits this long for queued messages
 
 
 class Notifier:
-    """Sends to one chat (yours). Never raises: a failed notification must not stop trading logic."""
+    """Sends to one chat (yours). Never raises: a failed notification must not stop trading logic.
+
+    send() only queues the text: a slow or hanging Bot API never delays a trade, a close or the age check.
+    """
 
     def __init__(self, token: str | None, chat_id: int | None, transport: httpx.AsyncBaseTransport | None = None):
         self.enabled = bool(token and chat_id)
@@ -27,8 +32,16 @@ class Notifier:
             transport=transport,
         )
         self.sent: list[str] = []  # kept for tests / debugging
+        self._queue: asyncio.Queue[str] | None = None
+        self._worker: asyncio.Task | None = None
 
     async def aclose(self) -> None:
+        if self._queue is not None and self._worker is not None and not self._worker.done():
+            try:
+                await asyncio.wait_for(self._queue.join(), DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.error("notify_dropped", queued=self._queue.qsize())
+            self._worker.cancel()
         await self.http.aclose()
 
     async def send(self, text: str) -> None:
@@ -36,12 +49,27 @@ class Notifier:
         logger.info("notify", text=text)
         if not self.enabled:
             return
+        if self._worker is None or self._worker.done():
+            self._queue = asyncio.Queue()
+            self._worker = asyncio.get_running_loop().create_task(self._run_queue(), name="notifier")
+        self._queue.put_nowait(text)
+
+    async def _run_queue(self) -> None:
+        while True:
+            text = await self._queue.get()
+            try:
+                await self._post(text)
+            finally:
+                self._queue.task_done()
+
+    async def _post(self, text: str) -> None:
         try:
             r = await self.http.post("sendMessage", json={"chat_id": self.chat_id, "text": text[:4000],
-                                                          "disable_web_page_preview": True})
+                                                          "disable_web_page_preview": True},
+                                     timeout=SEND_TIMEOUT_S)
             if r.status_code != 200:
                 logger.error("notify_failed", status=r.status_code, body=r.text[:300])
-        except httpx.HTTPError as e:
+        except Exception as e:  # never raises: httpx errors, timeouts, anything
             logger.error("notify_failed", error=repr(e))
 
     async def poll_commands(self, handler: CommandHandler, stop: asyncio.Event) -> None:
@@ -64,7 +92,8 @@ class Notifier:
                         continue
                     if text in COMMANDS:
                         reply = await handler(text)
-                        await self.send(reply)
+                        self.sent.append(reply)
+                        await self._post(reply)  # the owner is waiting for this answer: sent directly
             except (httpx.HTTPError, ValueError) as e:
                 logger.warning("poll_failed", error=repr(e))
                 await asyncio.sleep(5)

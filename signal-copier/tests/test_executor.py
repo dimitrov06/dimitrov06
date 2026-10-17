@@ -75,7 +75,7 @@ def test_gives_up_after_retries_without_duplicates(fake):
     assert storage.get_order("sc_n1001_900_0_0")["status"] == "FAILED"
     fake.post_failures = []
     r2 = run(ex.open_signal(gold(tp=("4490",)), DECISION, INFO))  # same signal again: never resent automatically
-    assert r2.skipped and fake.orders == {}
+    assert not r2.skipped and "по-рано" in r2.errors[0] and fake.orders == {}  # an error, not "done"
 
 
 def test_running_same_signal_twice_does_not_double(fake):

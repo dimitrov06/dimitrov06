@@ -251,3 +251,49 @@ class FakeMt5:
 
     def market_sends(self) -> list[dict]:
         return [r for r in self.sent if r["action"] == self.TRADE_ACTION_DEAL and "position" not in r]
+
+
+class StrictMt5(FakeMt5):
+    """FakeMt5 plus the trade-server checks the stock fake skips (IC Markets: stops level 0):
+
+    - SLTP: an SL beyond the closing price (BUY: SL >= Bid, SELL: SL <= Ask) or a TP on the wrong side -> 10016
+      "Invalid stops"; the same SL and TP the position already has -> 10025 "No changes";
+    - new market orders: SL/TP on the wrong side of the price -> 10016; pending price on the wrong side -> 10015.
+    A refused request changes nothing.
+    """
+
+    @staticmethod
+    def _no(code: int, comment: str):
+        return NS(retcode=code, comment=comment, order=0, deal=0, volume=0, price=0)
+
+    @staticmethod
+    def _stops_ok(buy: bool, sl: float, tp: float, bid: float, ask: float) -> bool:
+        return (not sl or (sl < bid if buy else sl > ask)) and (not tp or (tp > bid if buy else tp < ask))
+
+    def order_send(self, req):
+        a = req["action"]
+        if a == self.TRADE_ACTION_SLTP and req.get("position") in self.positions:
+            p = self.positions[req["position"]]
+            bid, ask = self.ticks[p.symbol]
+            if (req["sl"], req["tp"]) == (p.sl, p.tp):
+                self.sent.append(dict(req))
+                return self._no(10025, "No changes")
+            if not self._stops_ok(p.type == self.POSITION_TYPE_BUY, req["sl"], req["tp"], bid, ask):
+                self.sent.append(dict(req))
+                return self._no(10016, "Invalid stops")
+        elif a in (self.TRADE_ACTION_DEAL, self.TRADE_ACTION_PENDING) and "position" not in req:
+            bid, ask = self.ticks[req["symbol"]]
+            t = req["type"]
+            if a == self.TRADE_ACTION_PENDING:
+                ok = {self.ORDER_TYPE_BUY_LIMIT: req["price"] < ask, self.ORDER_TYPE_SELL_LIMIT: req["price"] > bid,
+                      self.ORDER_TYPE_BUY_STOP: req["price"] > ask, self.ORDER_TYPE_SELL_STOP: req["price"] < bid}[t]
+                if not ok:
+                    self.sent.append(dict(req))
+                    return self._no(10015, "Invalid price")
+            elif not self._stops_ok(t == self.ORDER_TYPE_BUY, req["sl"], req["tp"], bid, ask):
+                self.sent.append(dict(req))
+                return self._no(10016, "Invalid stops")
+        return super().order_send(req)
+
+    def sltp_sends(self) -> list[dict]:
+        return [r for r in self.sent if r["action"] == self.TRADE_ACTION_SLTP]

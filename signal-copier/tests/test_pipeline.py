@@ -36,7 +36,7 @@ def test_record_mode_stores_signal_and_close_without_trading(make_pipeline, fake
 
     sig = p.storage.get_signal("-1001:501:0")
     assert sig["status"] == "RECORDED" and sig["symbol"] == "AUD_USD"
-    fu = p.storage.get_follow_up("-1001:502:CLOSE")
+    fu = p.storage.get_follow_up("-1001:502:CLOSE:AUD_USD")
     assert fu["status"] == "RECORDED" and fu["signal_key"] == "-1001:501:0" and fu["price"] == "0.69530"
     assert fake.requests == []  # never touched OANDA
     assert any("Нов сигнал" in t for t in p.notifier.sent)
@@ -90,7 +90,7 @@ def test_close_reply_closes_all_trades_and_edit_does_not_close_twice(make_pipeli
     run(p.handle_message(msg(AUDUSD_CLOSE, 502, reply_to=501)))
     closes = [r for r in fake.requests if r[0] == "PUT" and r[1].endswith("/close")]
     assert len(closes) == 2
-    assert p.storage.get_follow_up("-1001:502:CLOSE")["status"] == "EXECUTED"
+    assert p.storage.get_follow_up("-1001:502:CLOSE:AUD_USD")["status"] == "EXECUTED"
 
     run(p.handle_message(msg(AUDUSD_CLOSE + " ✅", 502, reply_to=501, edited=True)))  # channel edits the message
     assert len([r for r in fake.requests if r[0] == "PUT" and r[1].endswith("/close")]) == 2
@@ -123,7 +123,7 @@ def test_follow_up_by_symbol_finds_recent_signal(make_pipeline, fake):
     p = make_pipeline(Mode.PAPER)
     run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
     run(p.handle_message(msg("AUDUSD close now", 505)))
-    assert p.storage.get_follow_up("-1001:505:CLOSE")["signal_key"] == "-1001:501:0"
+    assert p.storage.get_follow_up("-1001:505:CLOSE:AUD_USD")["signal_key"] == "-1001:501:0"
 
 
 def test_stop_command_blocks_new_trades_but_resume_allows(make_pipeline, fake):

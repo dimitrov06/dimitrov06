@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from signal_copier import log
-from signal_copier.executor import Executor, OandaClient
+from signal_copier.executor import Executor, OandaClient, Waiting
 from signal_copier.models import FollowUp, FollowUpAction, IncomingMessage, ParseStatus, Signal
 from signal_copier.notifier import Notifier
 from signal_copier.parser import SignalParser
@@ -25,7 +25,11 @@ logger = log.get("pipeline")
 DONE = ("EXECUTED", "RECORDED")
 # applying these twice does no harm, so a FAILED one may run again when the channel edits the message
 RETRYABLE = (FollowUpAction.MOVE_SL_BE, FollowUpAction.MOVE_SL, FollowUpAction.CLOSE, FollowUpAction.CANCEL)
-
+SL_MOVES = (FollowUpAction.MOVE_SL_BE, FollowUpAction.MOVE_SL)
+INFO_ONLY = (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)
+# a rejected signal is evaluated again after an edit only for reasons an edit can fix, inside the age window
+EDIT_FIXABLE = ("missing_sl", "uncertain_message:")
+REPLY_HOPS = 3  # "Close" replying to a "TP1 hit" post that replies to the signal
 
 def _fmt_signal(s: Signal) -> str:
     entry = s.entry.type.value
@@ -71,6 +75,7 @@ class Pipeline:
         self.clock = clock
         self._lock = asyncio.Lock()
         self._trade_blocked = ""  # last reason MT5 could not trade, notified once per change
+        self._halt_cancel_errors = ""  # last failure to cancel pending orders after the daily stop
 
     # ------------------------------------------------------------- state
 
@@ -98,8 +103,26 @@ class Pipeline:
             self.storage.add_event("halt", "DAILY_LOSS_LIMIT")
             await self.notifier.send(
                 f"🛑 Достигнат дневен лимит на загуба ({self.settings.risk.daily_loss_limit_pct}%). "
-                "Нови сделки спират до утре (UTC). Отворените остават."
+                "Нови сделки спират до утре (UTC). Отворените остават, чакащите поръчки се отменят."
             )
+            await self._cancel_pending_after_halt()
+
+    async def _cancel_pending_after_halt(self) -> None:
+        """A pending order filling after the daily stop would be a new trade: remove them (again every round)."""
+        cancel_all = getattr(self.executor, "cancel_all_pending", None)
+        if cancel_all is None or self.mode is Mode.RECORD or not self.storage.orders_with_status("PENDING"):
+            return
+        done, errors = await cancel_all()
+        if done:
+            self.storage.add_event("halt", "PENDING_CANCELLED", data=done)
+        if errors:
+            self.storage.add_event("halt", "PENDING_CANCEL_FAILED", "; ".join(errors))
+        new_errors = "; ".join(errors)
+        if done or (errors and new_errors != self._halt_cancel_errors):
+            await self.notifier.send("🛑 Дневен лимит: чакащите поръчки\n" + "\n".join(
+                done + [f"❗ не успях да отменя {e}. Пробвам пак след малко; отмени я ръчно в MT5, ако може."
+                        for e in errors]))
+        self._halt_cancel_errors = new_errors
 
     # ---------------------------------------------------------- messages
 
@@ -136,10 +159,11 @@ class Pipeline:
                 f"⚠️ Не разбрах съобщението със сигурност ({reasons}), НЕ търгувам.\n\n{msg.text[:1500]}"
             )
             return
-        for s in result.signals:
-            await self.handle_signal(s)
+        # commands first: "Close XAUUSD" + a new XAUUSD signal in one message must not find the new one
         for fu in result.follow_ups:
             await self.handle_follow_up(fu)
+        for s in result.signals:
+            await self.handle_signal(s)
 
     # ----------------------------------------------------------- signals
 
@@ -155,7 +179,14 @@ class Pipeline:
             if not s.edited:
                 self.storage.add_event("signal", "DUPLICATE", signal_key=s.key)
                 return
-            # a rejected signal was edited (e.g. SL added): evaluate it again
+        if s.edited:
+            why = self._edit_cannot_trade(s, existing)
+            if why:
+                self.storage.add_event("edit", "EDIT_IGNORED", why, signal_key=s.key)
+                was = f", отхвърлен по-рано ({existing['reason']})" if existing else ""
+                await self.notifier.send(f"⚠️ Каналът редактира сигнал {_fmt_signal(s)}{was}. Не търгувам: {why}.")
+                return
+            # a rejected signal was edited right after it was posted (e.g. SL added): evaluate it again
 
         await self.notifier.send(f"📩 Нов сигнал{' (редактиран)' if s.edited else ''}: {_fmt_signal(s)}")
 
@@ -200,12 +231,47 @@ class Pipeline:
         if lines:
             await self.notifier.send("\n".join(lines))
 
+    def _posted_at(self, s: Signal, existing: dict | None) -> datetime:
+        """When the channel posted the message (an edit never makes a signal younger)."""
+        dates = [s.date, self.storage.message_posted_at(s.chat_id, s.message_id)]
+        if existing:
+            dates.append(datetime.fromisoformat(existing["date"]))
+        return min(d for d in dates if d is not None)
+
+    def _new_management(self, s: Signal, existing: dict | None) -> list[FollowUp]:
+        """Commands the edit wrote into the signal block that the earlier version did not have."""
+        if not s.management:
+            return []
+        before: set[FollowUpAction] = set()
+        if existing:
+            old = IncomingMessage(chat_id=s.chat_id, message_id=s.message_id, text=existing["raw_text"],
+                                  date=s.date)
+            for o in self.parser.parse(old).signals:
+                if o.key == s.key:
+                    before = {f.action for f in o.management}
+        return [f for f in s.management if f.action not in before]
+
+    def _edit_cannot_trade(self, s: Signal, existing: dict | None) -> str | None:
+        """Why an edited, not yet traded signal must not be traded now (None: evaluate it like a new one)."""
+        if existing and existing["status"] == "FAILED":
+            return "предишният опит е завършил с грешка/отказ от брокера, не го пускам отново автоматично"
+        if existing and not (existing["reason"] or "").startswith(EDIT_FIXABLE):
+            return f"причината ({existing['reason']}) не се оправя с редакция"
+        age = (self.clock() - self._posted_at(s, existing)).total_seconds()
+        if age > self.settings.risk.max_signal_age_seconds:
+            return f"публикуван е преди {int(age)} s (max {self.settings.risk.max_signal_age_seconds} s)"
+        new = self._new_management(s, existing)
+        if new:
+            return "редакцията добавя команда/резултат (" + ", ".join(f.action.value for f in new) + ")"
+        return None
+
     async def _evaluate(self, s: Signal):
         info = await self.client.instrument(s.symbol)
         bid, ask, rate = await self.client.pricing(s.symbol)
         account = await self.client.account_summary()
         nav = Decimal(account["NAV"])
-        positions = self.storage.open_positions()
+        positions = self.storage.open_positions()  # pending orders always count per symbol (no stacking)
+        counted = self.storage.open_positions(include_pending=self.settings.risk.count_pending_in_max_open)
         ctx = RiskContext(
             now=self.clock(),
             balance=Decimal(account["balance"]),
@@ -215,7 +281,7 @@ class Pipeline:
             ask=ask,
             quote_to_home=rate,
             instrument=info,
-            open_positions=len({p["signal_key"] for p in positions}),
+            open_positions=len({p["signal_key"] for p in counted}),
             open_positions_symbol=len({p["signal_key"] for p in positions if p["instrument"] == s.symbol}),
             halted_reason=self.halted_reason(),
         )
@@ -231,50 +297,118 @@ class Pipeline:
             return
         old_sl = Decimal(existing["sl"]) if existing["sl"] else None
         old_tps = [Decimal(t) for t in json.loads(existing["tps"])]
-        if old_sl == s.sl and old_tps == s.tp:
+        management = self._new_management(s, existing)
+        changed = not (old_sl == s.sl and old_tps == s.tp)
+        if changed and management:
+            # "TP1 hit ✅ 4485.10" next to changed numbers: which of them is a level is a guess, so none is moved
+            self.storage.add_event("edit", "EDIT_IGNORED", "levels_and_management_text", signal_key=s.key)
+            await self.notifier.send(
+                f"⚠️ Каналът редактира сигнал {s.symbol}: смени нивата (SL {old_sl} → {s.sl}, TP {old_tps} → {s.tp})"
+                f" и добави команда/резултат. Не местя SL/TP автоматично, провери.\n\n{s.raw_text[:1000]}")
+        elif changed:
+            done: list[str] = []
+            if self.mode is not Mode.RECORD and existing["status"] == "EXECUTED":
+                info = await self.client.instrument(s.symbol)
+                # an SL the edit did not touch is not sent: the live one may already be at BE
+                done = await self.executor.amend_levels(s.key, s.sl if s.sl != old_sl else None, s.tp, info)
+            self.storage.update_signal_levels(s.key, s.sl, s.tp)  # after amend_levels: raises keep the old levels
+            self.storage.add_event("edit", "AMENDED", signal_key=s.key,
+                                   data={"sl": s.sl, "tp": s.tp, "actions": done})
+            await self.notifier.send(
+                f"✏️ Редактиран сигнал {s.symbol}: SL {old_sl} → {s.sl}, TP {old_tps} → {s.tp}"
+                + (f"\n" + "\n".join(done) if done else "")
+            )
+        elif not management:
             self.storage.add_event("edit", "NO_CHANGE", signal_key=s.key)
             return
-        done: list[str] = []
-        if self.mode is not Mode.RECORD and existing["status"] == "EXECUTED":
-            info = await self.client.instrument(s.symbol)
-            done = await self.executor.amend_levels(s.key, s.sl, s.tp, info)  # raises: DB keeps the old levels
-        self.storage.update_signal_levels(s.key, s.sl, s.tp)
-        self.storage.add_event("edit", "AMENDED", signal_key=s.key,
-                               data={"sl": s.sl, "tp": s.tp, "actions": done})
-        await self.notifier.send(
-            f"✏️ Редактиран сигнал {s.symbol}: SL {old_sl} → {s.sl}, TP {old_tps} → {s.tp}"
-            + (f"\n" + "\n".join(done) if done else "")
-        )
+        for fu in management:  # "CANCELLED", "Close now", "move SL to BE" written into the post itself
+            await self.handle_follow_up(fu, target=self.storage.get_signal(s.key))
 
     # -------------------------------------------------------- follow-ups
 
+    def _reply_target(self, fu: FollowUp) -> tuple[list[dict] | None, str | None]:
+        """Signals of the replied-to message, following replies to replies ("Close" -> "TP1 hit" -> signal).
+
+        None: the chain ends at stored messages without a signal (the symbol may still find the trade).
+        A chain that reaches a message the bot never stored (posted before its history) or is longer than
+        REPLY_HOPS may lead to a trade the bot does not have: not found, never another trade by symbol.
+        """
+        mid = fu.reply_to_msg_id
+        for _ in range(REPLY_HOPS):
+            signals = self.storage.signals_for_message(fu.chat_id, mid)
+            if signals:  # a signal message ends the walk, even a rejected one: never jump to another trade
+                done = [c for c in signals if c["status"] in DONE]
+                return done, None if done else "target_signal_not_found"
+            if self.storage.message_posted_at(fu.chat_id, mid) is None:
+                return None, "target_signal_not_found"
+            mid = self.storage.message_reply_to(fu.chat_id, mid)
+            if mid is None:
+                return None, None
+        return None, "target_signal_not_found"
+
     def _resolve_target(self, fu: FollowUp) -> tuple[dict | None, str | None]:
-        candidates: list[dict] = []
+        candidates: list[dict] | None = None
         if fu.reply_to_msg_id is not None:
-            candidates = [c for c in self.storage.signals_for_message(fu.chat_id, fu.reply_to_msg_id)
-                          if c["status"] in DONE]
-            if fu.symbol:
-                candidates = [c for c in candidates if c["symbol"] == fu.symbol] or candidates
-        elif fu.symbol is not None:
+            candidates, problem = self._reply_target(fu)
+            if problem:
+                return None, problem
+            if candidates is not None and fu.symbol:
+                same = [c for c in candidates if c["symbol"] == fu.symbol]
+                if not same:  # "Close AUDUSD" as a reply to the XAUUSD signal: two hints disagree, do nothing
+                    names = "/".join(sorted({c["symbol"] for c in candidates}))
+                    return None, f"symbol_mismatch:{fu.symbol}≠{names}"
+                candidates = same
+        if candidates is None:
+            if fu.symbol is None:
+                return None, "target_signal_not_found" if fu.reply_to_msg_id is not None else "no_reply_and_no_symbol"
             since = self.clock() - timedelta(hours=self.settings.executor.follow_up_symbol_lookback_hours)
-            candidates = self.storage.recent_signals_for_symbol(fu.chat_id, fu.symbol, since)
-        else:
-            return None, "no_reply_and_no_symbol"
+            if self.mode is Mode.RECORD:  # nothing is traded: the latest signals in the window
+                candidates = self.storage.recent_signals_for_symbol(fu.chat_id, fu.symbol, since)
+            else:  # only signals that still have an open trade or a pending order, however old
+                candidates = self.storage.open_signals_for_symbol(fu.chat_id, fu.symbol)
+                if not candidates and fu.action in INFO_ONLY:  # "SL hit" after the trade closed
+                    candidates = self.storage.recent_signals_for_symbol(fu.chat_id, fu.symbol, since)[:1]
+            # "Close XAUUSD" + a new XAUUSD signal in one message: the command is never about that new signal
+            candidates = [c for c in candidates if c["message_id"] != fu.message_id]
         if not candidates:
             return None, "target_signal_not_found"
         if len(candidates) > 1:
             return None, "ambiguous_target"
         return candidates[0], None
 
-    async def handle_follow_up(self, fu: FollowUp) -> None:
+    def _previous_follow_up(self, fu: FollowUp) -> dict | None:
+        prev = self.storage.get_follow_up(self.storage.follow_up_key(fu))
+        if prev is None and fu.symbol is not None:  # written before the symbol was part of the key
+            old = self.storage.get_follow_up(self.storage.follow_up_key(fu, legacy=True))
+            target = self.storage.get_signal(old["signal_key"]) if old and old["signal_key"] else None
+            if old and (target is None or target["symbol"] == fu.symbol):
+                prev = old
+        return prev
+
+    @staticmethod
+    def _may_run_again(fu: FollowUp, prev: dict) -> bool:
+        if prev["status"] == "FAILED" and fu.action in RETRYABLE:
+            return True
+        if fu.action in SL_MOVES:  # an edit that corrects the price, or a first attempt that did not go through
+            old_price = Decimal(prev["price"]) if prev["price"] else None
+            return prev["status"] in ("FAILED", "REJECTED") or old_price != fu.price
+        return False
+
+    async def handle_follow_up(self, fu: FollowUp, target: dict | None = None) -> None:
+        """target: the signal, when the command was written into that signal's own post (an edit)."""
         fkey = self.storage.follow_up_key(fu)
-        prev = self.storage.get_follow_up(fkey)
-        if prev and not (prev["status"] == "FAILED" and fu.action in RETRYABLE):
+        prev = self._previous_follow_up(fu)
+        if prev and not self._may_run_again(fu, prev):
             self.storage.add_event("follow_up", "DUPLICATE", message_key=fkey)
-            return  # e.g. the channel edited its "close" message: never close twice
+            if fu.edited:  # e.g. the channel edited its "close" message: never close twice, but say so
+                await self.notifier.send(f"ℹ️ Каналът редактира команда {fu.action.value} (msg {fu.message_id}): "
+                                         f"вече е обработена ({prev['status']}), не я повтарям.")
+            return
         if prev:
             self.storage.add_event("follow_up", "RETRY", prev["reason"], message_key=fkey)
-        target, problem = self._resolve_target(fu)
+        problem = None
+        if target is None:
+            target, problem = self._resolve_target(fu)
         if target is None:
             self.storage.save_follow_up(fu, None, "REJECTED", problem)
             self.storage.add_event("follow_up", "REJECTED", problem, message_key=fkey)
@@ -284,7 +418,7 @@ class Pipeline:
 
         key = target["key"]
         label = f"{fu.action.value} за {target['symbol']} {target['side']} (msg {target['message_id']})"
-        if fu.action in (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT):
+        if fu.action in INFO_ONLY:
             self.storage.save_follow_up(fu, key, "RECORDED")
             self.storage.add_event("follow_up", "RECORDED", signal_key=key, message_key=fkey)
             await self.notifier.send(f"ℹ️ Каналът съобщава {label}")
@@ -304,9 +438,36 @@ class Pipeline:
             self.storage.add_event("follow_up", "FAILED", repr(e), signal_key=key, message_key=fkey)
             await self.notifier.send(f"❗ Грешка при {label}: {e!r}")
             return
-        self.storage.save_follow_up(fu, key, "EXECUTED", None if done else "nothing_to_do")
-        self.storage.add_event("follow_up", "EXECUTED", signal_key=key, message_key=fkey, data=done)
+        waiting = any(isinstance(d, Waiting) for d in done)
+        status = "WAITING" if waiting else "EXECUTED"
+        self.storage.save_follow_up(fu, key, status, None if done else "nothing_to_do")
+        self.storage.add_event("follow_up", status, signal_key=key, message_key=fkey, data=done)
         await self.notifier.send(f"🔧 {label}:\n" + ("\n".join(done) if done else "няма отворени сделки/поръчки"))
+
+    async def _retry_waiting(self) -> None:
+        """SL moves that could not be applied yet (BE while the price was behind the entry)."""
+        for row in self.storage.follow_ups_with_status("WAITING"):
+            target = self.storage.get_signal(row["signal_key"]) if row["signal_key"] else None
+            fu = FollowUp(chat_id=row["chat_id"], message_id=row["message_id"], action=FollowUpAction(row["action"]),
+                          price=Decimal(row["price"]) if row["price"] else None, raw_text="",
+                          date=datetime.fromisoformat(row["date"]))
+            if target is None:
+                self.storage.update_follow_up(row["key"], "REJECTED", "target_gone")
+                continue
+            label = f"{fu.action.value} за {target['symbol']} {target['side']} (msg {target['message_id']})"
+            try:
+                info = await self.client.instrument(target["symbol"])
+                done = await self.executor.apply_follow_up(fu, target["key"], info)
+            except Exception as e:  # MT5 busy or down: keep waiting, the next round tries again
+                logger.warning("waiting_follow_up_failed", follow_up=row["key"], error=repr(e))
+                continue
+            if any(isinstance(d, Waiting) for d in done):
+                continue
+            self.storage.update_follow_up(row["key"], "EXECUTED", None if done else "nothing_to_do")
+            self.storage.add_event("follow_up", "EXECUTED", "after_waiting", signal_key=target["key"],
+                                   message_key=row["key"], data=done)
+            await self.notifier.send(f"🔧 {label} (изчакано):\n" + ("\n".join(done) if done else
+                                                                    "сделката вече е затворена"))
 
     # ------------------------------------------------- monitor & commands
 
@@ -324,16 +485,24 @@ class Pipeline:
                         f"{t['units']} @ {t['price']}. Ботът я управлява.")
             else:
                 text = f"✅ Изпълнена чакаща поръчка {t['instrument']}: {t['units']} @ {t['price']}"
+                if self.storage.get_state("halt_day") == self._today():
+                    text += " ⚠️ след дневния лимит: не успях да я отменя навреме, позицията е със SL/TP"
             await self.notifier.send(text)
         for t in closed:
             await self.notifier.send(
                 f"🏁 Затворена {t['instrument']} trade {t['trade_id']} @ {t['close_price']}, P/L {t['realized_pl']}"
             )
+        async with self._lock:  # these act on positions: never in the middle of a channel command
+            await self._retry_waiting()
         await self._check_trade_allowed()
         account = await self.client.account_summary()
         nav = Decimal(account["NAV"])
-        if self.risk.daily_loss_hit(nav, self._day_start_nav(nav)):
-            await self._halt_for_today()
+        async with self._lock:
+            halted = self.storage.get_state("halt_day") == self._today()
+            if self.risk.daily_loss_hit(nav, self._day_start_nav(nav)):
+                await self._halt_for_today()  # the first time it also cancels the pending orders
+            if halted:  # every round after: one that could not be cancelled is tried again
+                await self._cancel_pending_after_halt()
 
     async def _check_trade_allowed(self) -> None:
         """MT5: tell the owner once when the terminal stops being able to trade (Algo Trading off ...) and back."""
@@ -355,7 +524,12 @@ class Pipeline:
         if cmd == "/stop":
             self.storage.set_state("halt_manual", self.clock().isoformat())
             self.storage.add_event("command", "STOP")
-            return "⛔ Спрях нови сделки. Отворените сделки и follow-up командите продължават. /resume за пускане."
+            pending = self.storage.orders_with_status("PENDING")
+            extra = (f"\n⏳ Чакащи поръчки в MT5: {len(pending)} ("
+                     + ", ".join(f"{o['instrument']} #{o['oanda_order_id']}" for o in pending)
+                     + "). Те остават и могат да се изпълнят; отмени ги в MT5, ако не ги искаш.") if pending else ""
+            return ("⛔ Спрях нови сделки. Отворените сделки и follow-up командите продължават. /resume за пускане."
+                    + extra)
         if cmd == "/resume":
             self.storage.set_state("halt_manual", None)
             self.storage.add_event("command", "RESUME")
@@ -372,7 +546,8 @@ class Pipeline:
             f"Режим: {self.mode.value}",
             f"Състояние: {'спрян (' + self.halted_reason() + ')' if self.halted_reason() else 'активен'}",
             f"Сигнали днес: {sum(counts.values())} " + (str(counts) if counts else ""),
-            f"Отворени позиции: {len({p['signal_key'] for p in self.storage.open_positions()})}",
+            f"Отворени позиции: {len({p['signal_key'] for p in self.storage.open_positions(include_pending=False)})}"
+            f", чакащи поръчки: {len(self.storage.orders_with_status('PENDING'))}",
         ]
         if self.client is not None:
             try:

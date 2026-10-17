@@ -5,9 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+import time
 
 from signal_copier import log
 from signal_copier.settings import ConfigError, load, mt5_check_credentials, oanda_credentials
+
+# after a crash (MT5 terminal not up yet at boot, network down, ...) `run` starts again after these delays;
+# a config error (wrong account type, Algo Trading off, not logged in to Telegram) stays fatal
+RESTART_DELAYS_S = (10, 30, 60, 120, 300)
+STABLE_RUN_S = 600  # a run this long resets the delay
+_sleep = time.sleep  # tests replace it
 
 
 async def _login(settings, secrets) -> None:
@@ -86,14 +93,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"config error: {e}", file=sys.stderr)
             return 2
     else:
-        from signal_copier.app import run
+        return _run_forever(settings, secrets)
+    return 0
 
+
+def _run_forever(settings, secrets) -> int:
+    """Windows Task Scheduler does not restart a task that exits with an error, so the bot does it itself."""
+    from signal_copier.app import run
+
+    logger = log.get("main")
+    failures = 0
+    while True:
+        started = time.monotonic()
         try:
             asyncio.run(run(settings, secrets))
+            return 0  # stopped on purpose (Ctrl+C / SIGTERM)
         except ConfigError as e:
             print(f"config error: {e}", file=sys.stderr)
             return 2
-    return 0
+        except KeyboardInterrupt:
+            return 130
+        except Exception as e:
+            if time.monotonic() - started >= STABLE_RUN_S:
+                failures = 0
+            delay = RESTART_DELAYS_S[min(failures, len(RESTART_DELAYS_S) - 1)]
+            failures += 1
+            logger.exception("run_failed_restarting", delay_s=delay, attempt=failures)
+            print(f"signal-copier stopped with an error ({e!r}); restarting in {delay} s", file=sys.stderr)
+            _sleep(delay)
 
 
 if __name__ == "__main__":

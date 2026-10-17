@@ -26,7 +26,7 @@ from types import SimpleNamespace as NS
 from typing import Any
 
 from signal_copier import log
-from signal_copier.executor.executor import ExecResult, client_id
+from signal_copier.executor.executor import ExecResult, Waiting, client_id
 from signal_copier.models import EntryType, FollowUp, FollowUpAction, Side, Signal
 from signal_copier.risk import InstrumentInfo, RiskDecision, plan_parts, tp_for_part
 from signal_copier.settings import ConfigError, Mt5Cfg, Mt5Credentials
@@ -39,6 +39,10 @@ REQUOTE, PRICE_CHANGED, PRICE_OFF, TOO_MANY_REQUESTS = 10004, 10020, 10021, 1002
 TIMEOUT, CONNECTION = 10012, 10031
 RETRY_FRESH_PRICE = {REQUOTE, PRICE_CHANGED, PRICE_OFF, TOO_MANY_REQUESTS}
 AMBIGUOUS = {TIMEOUT, CONNECTION}
+# a market order (first send or retry after a requote) is not sent when the SL got this much further away than
+# the distance the size was computed for: the same lots would risk more than planned
+RETRY_MAX_SL_GROWTH = Decimal("1.1")
+NOT_CONNECTED = "терминалът няма връзка със сървъра на брокера"
 ACCOUNT_TRADE_MODE_DEMO = 0
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
 RES_S_OK = 1
@@ -120,6 +124,9 @@ class Mt5Client:
             if blockers is None or blockers:
                 why = "; ".join(blockers) if blockers else f"MT5 не отговаря ({await self.call('last_error')})"
                 await self.call("shutdown")
+                if blockers is None or blockers == [NOT_CONNECTED]:
+                    # at boot the terminal answers before it has reached the broker: `run` starts again later
+                    raise Mt5Error(f"MT5 още не може да търгува: {why}")
                 raise ConfigError(f"MT5 не може да търгува: {why}")
         logger.info("mt5_connected", login=acc.login, server=acc.server, demo=is_demo, currency=acc.currency)
         return {"login": acc.login, "server": acc.server, "demo": is_demo}
@@ -132,7 +139,7 @@ class Mt5Client:
             return None
         out = []
         if not term.connected:
-            out.append("терминалът няма връзка със сървъра на брокера")
+            out.append(NOT_CONNECTED)
         if not term.trade_allowed:
             out.append("бутонът Algo Trading в MT5 е изключен")
         if getattr(term, "tradeapi_disabled", False):
@@ -175,6 +182,7 @@ class Mt5Client:
                 display_precision=int(si.digits),
                 trade_units_precision=_units_precision(si.volume_step),  # units are lots here
                 minimum_trade_size=Decimal(str(si.volume_min)),
+                maximum_trade_size=Decimal(str(si.volume_max)) if getattr(si, "volume_max", 0) else None,
             )
         return self._info[instrument]
 
@@ -192,10 +200,11 @@ class Mt5Client:
 class Mt5Executor:
     def __init__(self, client: Mt5Client, storage: Storage, retry_attempts: int = 4,
                  retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240,
-                 tp_mode: str = "last"):
+                 tp_mode: str = "last", max_sl_deviation_pct: float = 10.0):
         self.client = client
         self.mt5 = client.mt5
         self.storage = storage
+        self.max_sl_deviation_pct = max_sl_deviation_pct  # an SL move further than this from entry is refused
         self.retry_attempts = retry_attempts
         self.retry_base_delay_s = retry_base_delay_s
         self.pending_expiry = timedelta(minutes=pending_expiry_minutes)
@@ -266,8 +275,11 @@ class Mt5Executor:
             if not self.storage.create_order(cid, s.key, part, s.symbol, lots * sign, s.entry.type.value,
                                              price, s.sl, tp):
                 existing = self.storage.get_order(cid)
-                if existing["status"] not in ("PENDING_SEND", "SENT"):
-                    result.skipped.append(cid)
+                if existing["status"] in ("FILLED", "PENDING"):
+                    result.skipped.append(cid)  # done earlier
+                    continue
+                if existing["status"] not in ("PENDING_SEND", "SENT"):  # rejected/failed/cancelled: nothing at MT5
+                    result.errors.append(f"{cid}: {existing['status']} по-рано, не я пращам отново")
                     continue
                 found = await self._find_by_tag(tag)
                 if found is None and existing["status"] == "SENT":
@@ -275,7 +287,8 @@ class Mt5Executor:
                 if found is not None:
                     self._record_found(s, cid, found, lots, tp, result)
                     continue
-            await self._send(s, cid, tag, lots, price, tp, info, si, result)
+            await self._send(s, cid, tag, lots, price, tp, info, si, result,
+                             decision.size_distance or decision.sl_distance)
         return result
 
     async def _request(self, s: Signal, tag: str, lots: Decimal, price: Decimal | None, tp: Decimal | None,
@@ -305,7 +318,8 @@ class Mt5Executor:
                        type_filling=m.ORDER_FILLING_RETURN)
         return req
 
-    async def _send(self, s, cid, tag, lots, price, tp, info, si, result: ExecResult) -> None:
+    async def _send(self, s, cid, tag, lots, price, tp, info, si, result: ExecResult,
+                    planned_sl_distance: Decimal | None = None) -> None:
         for attempt in range(self.retry_attempts):
             try:
                 req = await self._request(s, tag, lots, price, tp, info, si)  # fresh price on every attempt
@@ -313,6 +327,15 @@ class Mt5Executor:
                 self.storage.update_order(cid, status="FAILED")
                 result.errors.append(f"{cid}: not sent ({e})")
                 return
+            if planned_sl_distance and s.entry.type is EntryType.MARKET:
+                # the lots were sized for the price the risk check saw: a retry (after a requote / PRICE_OFF)
+                # must not take a price where the same lots risk clearly more
+                now_distance = abs(Decimal(str(req["price"])) - s.sl)
+                if now_distance > planned_sl_distance * RETRY_MAX_SL_GROWTH:
+                    self.storage.update_order(cid, status="FAILED")
+                    result.errors.append(f"{cid}: не я пращам отново: цената се отмести и SL е на {now_distance} "
+                                         f"вместо {planned_sl_distance}, рискът би бил по-голям от планирания")
+                    return
             self.storage.update_order(cid, status="SENT")
             try:
                 res = await self.client.call("order_send", req)
@@ -444,6 +467,34 @@ class Mt5Executor:
                "magic": self.client.cfg.magic}
         await self._check(await self.client.call("order_send", req), f"SL/TP {pos.ticket}")
 
+    def _looser(self, pos, sl: float) -> bool:
+        """True if `sl` is further from the price than the position's SL (more money at risk)."""
+        if not pos.sl:
+            return False
+        return sl < pos.sl if pos.type == self.mt5.POSITION_TYPE_BUY else sl > pos.sl
+
+    async def _move_sl(self, pos, sl: float, what: str = "") -> str:
+        """Tighten the SL to `sl` (BE or a price). Never loosens it; waits while the price is on the wrong side."""
+        target = f"{what} {sl}".strip()
+        if pos.sl == sl:
+            return f"SL вече е {target} (#{pos.ticket})"
+        if self._looser(pos, sl):
+            return (f"⚠️ SL остава {pos.sl} (#{pos.ticket}): {target} е по-далеч от цената, не разхлабвам SL "
+                    "автоматично")
+        if abs(sl - pos.price_open) / pos.price_open * 100 > self.max_sl_deviation_pct:
+            return f"⚠️ SL остава {pos.sl} (#{pos.ticket}): {sl} е твърде далеч от входа {pos.price_open}, не го прилагам"
+        buy = pos.type == self.mt5.POSITION_TYPE_BUY
+        tick = await self.client.read("symbol_info_tick", pos.symbol)
+        si = await self.client.call("symbol_info", pos.symbol)
+        gap = (getattr(si, "trade_stops_level", 0) or 0) * (getattr(si, "point", 0) or 0)
+        price = tick.bid if buy else tick.ask
+        if (buy and sl >= price - gap) or (not buy and sl <= price + gap):
+            # MT5 refuses an SL beyond the price (10016): keep the current SL and try again from the monitor
+            return Waiting(f"⏳ SL → {target} (#{pos.ticket}): цената е {price}, още не може; ще го преместя, щом "
+                           f"цената го позволи. Дотогава SL остава {pos.sl}")
+        await self._set_sltp(pos, sl=sl, tp=None)
+        return f"SL → {target} (#{pos.ticket})"
+
     async def _live_positions(self, signal_key: str) -> list:
         out = []
         for t in self.storage.trades_for_signal(signal_key, open_only=True):
@@ -485,12 +536,10 @@ class Mt5Executor:
 
         if fu.action is FollowUpAction.MOVE_SL_BE:
             for p in positions:
-                await self._set_sltp(p, sl=p.price_open, tp=None)
-                done.append(f"SL → BE {p.price_open} (#{p.ticket})")
+                done.append(await self._move_sl(p, p.price_open, "BE"))
         elif fu.action is FollowUpAction.MOVE_SL:
             for p in positions:
-                await self._set_sltp(p, sl=self._px(fu.price, info), tp=None)
-                done.append(f"SL → {fu.price} (#{p.ticket})")
+                done.append(await self._move_sl(p, self._px(fu.price, info)))
         elif fu.action is FollowUpAction.CLOSE:
             for p in positions:
                 await self._close(p, p.volume)
@@ -558,15 +607,42 @@ class Mt5Executor:
 
     async def amend_levels(self, signal_key: str, sl: Decimal | None, tps: list[Decimal],
                            info: InstrumentInfo) -> list[str]:
+        """The channel edited SL/TP. sl=None: the SL was not edited, keep the live one (it may be at BE).
+
+        Only what differs from the live position is sent, and a wider SL is never applied automatically.
+        """
         done = await self._reconcile_signal(signal_key)
         part_by_ticket = {o["oanda_trade_id"]: o["part"] for o in self.storage.orders_for_signal(signal_key)}
         for p in await self._live_positions(signal_key):
             part = part_by_ticket.get(str(p.ticket), 0)
             tp = tp_for_part(tps, part, self.tp_mode)
-            await self._set_sltp(p, sl=self._px(sl, info) if sl is not None else None,
-                                 tp=self._px(tp, info) if tp is not None else None)
-            done.append(f"#{p.ticket}: SL {sl}, TP {tp}")
+            new_tp = self._px(tp, info) if tp is not None else None
+            new_tp = None if new_tp == p.tp else new_tp
+            new_sl = self._px(sl, info) if sl is not None else None
+            if new_sl is not None and (new_sl == p.sl or self._looser(p, new_sl)):
+                if new_sl != p.sl:
+                    done.append(f"⚠️ #{p.ticket}: SL остава {p.sl}, не го разхлабвам до {new_sl} (рискът би станал "
+                                "по-голям от планирания). Ако го искаш, смени го ръчно в MT5.")
+                new_sl = None
+            if new_sl is None and new_tp is None:
+                continue
+            await self._set_sltp(p, sl=new_sl, tp=new_tp)
+            done.append(f"#{p.ticket}: SL {p.sl if new_sl is None else new_sl}, TP {p.tp if new_tp is None else new_tp}")
         return done
+
+    async def cancel_all_pending(self) -> tuple[list[str], list[str]]:
+        """Daily stop: remove every pending order of the bot. Returns (what was done, errors)."""
+        done, errors = [], []
+        for key in dict.fromkeys(o["signal_key"] for o in self.storage.orders_with_status("PENDING")):
+            try:
+                cancelled, filled = await self._cancel_pending(key)
+            except Exception as e:  # e.g. MT5 not answering: the row stays PENDING, the next round tries again
+                errors.append(f"{key}: {e}")
+                continue
+            done += cancelled
+            done += [f"⚠️ поръчката вече е изпълнена: позиция #{p.ticket} ({p.volume} лота) остава отворена със SL/TP"
+                     for p in filled]
+        return done, errors
 
     # ------------------------------------------------------------ monitoring
 

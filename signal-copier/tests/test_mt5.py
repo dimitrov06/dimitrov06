@@ -145,6 +145,7 @@ def test_move_sl_to_be_and_close_half():
     fake = FakeMt5()
     p, _ = make(fake)
     run(p.handle_message(msg(AUDUSD_SIGNAL, 501)))
+    fake.ticks["AUDUSD"] = (0.69450, 0.69452)  # TP1 0.69446 reached
     run(p.handle_message(msg("TP1 hit ✅ move SL to BE", 503, reply_to=501)))
     assert all(pos.sl == 0.69402 for pos in fake.positions.values())
     run(p.handle_message(msg("Close half", 504, reply_to=501)))
@@ -191,6 +192,7 @@ def test_rted_mode_one_position_with_tp2():
     sends = fake.market_sends()
     assert len(sends) == 1
     assert sends[0]["volume"] == 0.54 and sends[0]["tp"] == 0.69563 and sends[0]["sl"] == 0.69311
+    fake.ticks["AUDUSD"] = (0.69450, 0.69452)  # TP1 0.69446 reached
     run(p.handle_message(msg("TP1 hit ✅ move SL to BE", 503, reply_to=501)))
     (pos,) = fake.positions.values()
     assert pos.sl == 0.69402 and pos.tp == 0.69563

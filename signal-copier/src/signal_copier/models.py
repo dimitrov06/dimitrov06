@@ -75,6 +75,9 @@ class Signal(BaseModel):
     date: datetime
     edited: bool = False
     warnings: list[str] = Field(default_factory=list)
+    # commands written inside the signal block ("CANCELLED", "TP1 hit, move SL to BE"): never run for a new
+    # signal; on an edit, the ones the earlier version did not have are run against this signal
+    management: list[FollowUp] = Field(default_factory=list)
 
     @property
     def key(self) -> str:
@@ -108,6 +111,9 @@ class FollowUp(BaseModel):
     @property
     def has_target(self) -> bool:
         return self.reply_to_msg_id is not None or self.symbol is not None
+
+
+Signal.model_rebuild()
 
 
 class ParseIssue(BaseModel):

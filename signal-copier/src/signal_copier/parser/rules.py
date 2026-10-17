@@ -33,6 +33,7 @@ class RulesFile(BaseModel):
     tp_keyword: str
     noise: list[str]
     follow_ups: list[FollowUpRule]
+    unclear: list[str] = Field(default_factory=list)  # a command with these is never acted on (UNCERTAIN)
 
 
 class CompiledFollowUpRule:
@@ -58,6 +59,8 @@ class ParserRules:
         self.tp_keyword = re.compile(raw.tp_keyword)
         self.noise = [re.compile(p) for p in raw.noise]
         self.follow_ups = [CompiledFollowUpRule(r) for r in raw.follow_ups]
+        self.unclear = [re.compile(p) for p in raw.unclear]
+        self.tp_hit = re.compile(r"\b(?:HIT|REACHED|DONE|SMASHED|CLOSED|SECURED|BOOKED)\b")
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> ParserRules:

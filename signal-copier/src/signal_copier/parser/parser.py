@@ -92,6 +92,17 @@ class SignalParser:
             result.issues.append(ParseIssue(reason="conflicting_sides", text=block))
             return
 
+        management = not sides or (sl is None and not tps)
+        if management and any(p.search(block) for p in self.rules.unclear):
+            # "move SL to 20 pips in profit", "SL to 1:1": a distance or ratio, not a price
+            result.issues.append(ParseIssue(reason="unclear_sl_command", text=block))
+            return
+        actionable = [f for f in follow_ups if f.action not in (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)]
+        if management and actionable and len({m.instrument for m in self.symbols.find_all(block)}) > 1:
+            # "Close AUDUSD and XAUUSD now": one command per symbol is not guessed
+            result.issues.append(ParseIssue(reason="command_for_several_symbols", text=block))
+            return
+
         if sides:
             if follow_ups and sl is None and not tps:
                 # "Gold buy running, move SL to BE" is management, not a new trade
@@ -106,6 +117,7 @@ class SignalParser:
             else:
                 if follow_ups:
                     signal_or_issue.warnings.append("contains_management_text")
+                    signal_or_issue.management = follow_ups
                 result.signals.append(signal_or_issue)
             return
 
@@ -179,18 +191,37 @@ class SignalParser:
         return values.pop() if values else None
 
     def _find_tps(self, block: str) -> list[Decimal]:
-        tps: list[Decimal] = []
+        """TP levels in order. "TP2" is the second level wherever it is written (the "last" TP is the highest label).
+
+        A result note is not a level: numbers after HIT are dropped ("Target Profit 1 @ 4484.30 ✅ hit at 4485.10"
+        -> 4484.30), and a label that already appeared ignores later lines ("TP1 hit ✅ 4485.10" under the TP lines).
+        """
+        found: list[tuple[int | None, Decimal]] = []
+        labels: set[int] = set()
         for line in block.splitlines():
             if not self.rules.tp_keyword.search(line):
                 continue
             line = self.rules.sl.sub(" ", line)
             line = self._strip_noise(line)
-            for segment in self.rules.tp_keyword.split(line)[1:]:
+            keywords = list(self.rules.tp_keyword.finditer(line))
+            for i, kw in enumerate(keywords):
+                segment = line[kw.end(): keywords[i + 1].start() if i + 1 < len(keywords) else len(line)]
+                digit = re.search(r"\d", kw.group())
+                label = int(digit.group()) if digit else None
+                if label is not None and label in labels:
+                    continue  # "TP1 hit ✅ 4485.10" under the TP1 line: a result, not a new level
+                hit = self.rules.tp_hit.search(segment)
+                if hit and (label is None or NUMBER.search(segment[: hit.start()])):
+                    segment = segment[: hit.start()]  # "TP1 4484.30 hit at 4485.10" ("TP1 ✅ 4484.30" is a level)
                 for n in NUMBER.findall(segment):
                     value = Decimal(n)
-                    if value not in tps:
-                        tps.append(value)
-        return tps
+                    if all(value != v for _, v in found):
+                        found.append((label, value))
+                if label is not None:
+                    labels.add(label)
+        if found and all(label is not None for label, _ in found):
+            found.sort(key=lambda x: x[0])
+        return [v for _, v in found]
 
     def _find_entry(self, block: str) -> tuple[Decimal | None, tuple[Decimal, Decimal] | None]:
         lines = block.splitlines()

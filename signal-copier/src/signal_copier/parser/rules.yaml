@@ -78,9 +78,10 @@ follow_ups:
       - '\bBREAK\s*EVEN\b'
     suppresses: [MOVE_SL]
   - action: MOVE_SL
+    # the number must be a price: "20 pips", "1:1", "50%", "1.5R", "30 in profit" are not (see unclear below)
     patterns:
-      - '\b(?:MOVE|SET|PUT|SHIFT)\s+(?:THE\s+)?(?:SL|STOP\s*LOSS|STOP)\s+(?:TO\s+|AT\s+)?(?P<price>\d+(?:\.\d+)?)'
-      - '\bNEW\s+(?:SL|STOP\s*LOSS)\s*[:=@\-]?\s*(?P<price>\d+(?:\.\d+)?)'
+      - '\b(?:MOVE|SET|PUT|SHIFT)\s+(?:THE\s+)?(?:SL|STOP\s*LOSS|STOP)\s+(?:TO\s+|AT\s+)?(?P<price>\d+(?:\.\d+)?)(?!\d|\.\d|\s*(?:PIPS?\b|POINTS?\b|PTS\b|%|R\b|RR\b|:|\$)|\s+(?:IN\s+)?PROFIT)'
+      - '\bNEW\s+(?:SL|STOP\s*LOSS)\s*[:=@\-]?\s*(?P<price>\d+(?:\.\d+)?)(?!\d|\.\d|\s*(?:PIPS?\b|POINTS?\b|PTS\b|%|R\b|RR\b|:|\$)|\s+(?:IN\s+)?PROFIT)'
   - action: TP_HIT
     patterns:
       - '\bTP\s*(?P<tp>\d)\s*(?:IS\s+)?(?:HIT|DONE|REACHED|SMASHED)\b'
@@ -98,3 +99,9 @@ follow_ups:
       - '\bCLOSE\b[^\n]*?\bAT\s+(?P<price>\d+(?:\.\d+)?)'
       - '\bCLOSE(?:\s+(?:ALL|NOW|IT|FULL|THE\s+TRADE|TRADE|POSITION))?\b'
       - '\bEXIT(?:\s+NOW)?\b'
+
+# A stop-loss command whose number is a distance, a ratio or a percentage, not a price
+# ("move SL to 20 pips in profit", "SL to 1:1", "set SL at 50%"): the message is UNCERTAIN, nothing is done.
+unclear:
+  - '\b(?:MOVE|SET|PUT|SHIFT|TRAIL|UPDATE|CHANGE|NEW)\b[^\n]*?\b(?:SL|S/L|STOP\s*LOSS|STOPLOSS|STOP)\b\s*(?:TO\s+|AT\s+|[:=@\-]\s*)?[+\-]?\d+(?:\.\d+)?\s*(?:PIPS?\b|POINTS?\b|PTS\b|%|R\b|RR\b|:\s*\d|\$|IN\s+PROFIT\b|PROFIT\b|ABOVE\b|BELOW\b|FROM\b|AWAY\b)'
+  - '\b(?:SL|S/L|STOP\s*LOSS|STOPLOSS)\s+(?:TO|AT)\s+[+\-]?\d+(?:\.\d+)?\s*(?:PIPS?\b|POINTS?\b|PTS\b|%|R\b|RR\b|:\s*\d|IN\s+PROFIT\b|PROFIT\b)'

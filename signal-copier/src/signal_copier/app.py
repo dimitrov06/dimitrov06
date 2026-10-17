@@ -36,7 +36,7 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
     elif (mcreds := mt5_credentials(settings, secrets)) is not None:
         client = Mt5Client(mcreds, settings.mt5)
         executor = Mt5Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s,
-                               ex.pending_order_expiry_minutes, ex.tp_split)
+                               ex.pending_order_expiry_minutes, ex.tp_split, settings.parser.max_price_deviation_pct)
     pipeline = Pipeline(settings, storage, parser, notifier, RiskManager(settings.risk), client, executor)
     return pipeline, client, notifier
 
@@ -66,6 +66,8 @@ async def run(settings: Settings, secrets: Secrets) -> None:
         except Exception as e:
             await notifier.send(f"❗ signal-copier не стартира: {e}")
             await notifier.aclose()
+            await client.aclose()  # the restart loop builds everything again
+            pipeline.storage.close()
             raise
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -77,7 +79,8 @@ async def run(settings: Settings, secrets: Secrets) -> None:
 
     tg = make_client(secrets.tg_api_id, secrets.tg_api_hash, settings.telegram.session_dir,
                      settings.telegram.session_name)
-    listener = TelegramListener(tg, settings.telegram.channels, pipeline.storage, pipeline.handle_message)
+    listener = TelegramListener(tg, settings.telegram.channels, pipeline.storage, pipeline.handle_message,
+                                notify=notifier.send)
 
     broker = "" if client is None else f", брокер {settings.broker.value}"
     await notifier.send(f"🚀 signal-copier стартира в режим {settings.mode.value}{broker}.")

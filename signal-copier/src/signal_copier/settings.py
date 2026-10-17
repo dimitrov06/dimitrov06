@@ -56,12 +56,24 @@ class ParserCfg(BaseModel):
 class RiskCfg(BaseModel):
     risk_per_trade_pct: Decimal = Decimal("0.5")
     max_open_positions: int = 5
+    # False: only open positions count towards max_open_positions, pending LIMIT/STOP orders do not
+    # (a pending order that fills later can take the count above the limit). Per symbol they always count.
+    count_pending_in_max_open: bool = False
     max_positions_per_symbol: int = 2
     daily_loss_limit_pct: Decimal = Decimal("2.0")
+    # a new trade risks at most what is left of the daily limit (smaller size; rejected below the minimum)
+    cap_to_daily_budget: bool = True
     max_entry_slippage_sl_fraction: Decimal = Decimal("0.3")
+    # late entry after an adverse move: size as if the SL were at least this fraction of the channel's SL
+    # distance (at most ~3x the normal size), so an SL a few points away cannot blow up the lot size; up to that
+    # point the risk stays the full risk_per_trade_pct, as the RTED manual's late entry expects
+    late_entry_min_sl_fraction: Decimal = Decimal("0.33")
     max_signal_age_seconds: int = 60
     max_spread: dict[str, Decimal] = Field(default_factory=dict)
     default_max_spread_sl_fraction: Decimal = Decimal("0.15")
+    # round-turn commission in account currency per lot (MT5) / per unit (OANDA); 0 on a no-commission account
+    commission_per_lot: Decimal = Decimal(0)
+    max_lots: dict[str, Decimal] = Field(default_factory=dict)  # per instrument: a bigger size is rejected
 
 
 class ExecutorCfg(BaseModel):
