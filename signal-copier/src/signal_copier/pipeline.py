@@ -30,6 +30,7 @@ INFO_ONLY = (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)
 # a rejected signal is evaluated again after an edit only for reasons an edit can fix, inside the age window
 EDIT_FIXABLE = ("missing_sl", "uncertain_message:")
 REPLY_HOPS = 3  # "Close" replying to a "TP1 hit" post that replies to the signal
+UNCLEAR_TEXT = "unclear_management_text"  # parser warning: command-like text in a signal post that was left out
 
 
 def _fmt_tps(tps: list[Decimal]) -> str:
@@ -242,17 +243,19 @@ class Pipeline:
             dates.append(datetime.fromisoformat(existing["date"]))
         return min(d for d in dates if d is not None)
 
+    def _previous_version(self, s: Signal, existing: dict | None) -> Signal | None:
+        """The signal as the last handled version of its post read (raw_text is kept up to date by edits)."""
+        if not existing:
+            return None
+        old = IncomingMessage(chat_id=s.chat_id, message_id=s.message_id, text=existing["raw_text"], date=s.date)
+        return next((o for o in self.parser.parse(old).signals if o.key == s.key), None)
+
     def _new_management(self, s: Signal, existing: dict | None) -> list[FollowUp]:
         """Commands the edit wrote into the signal block that the earlier version did not have."""
         if not s.management:
             return []
-        before: set[FollowUpAction] = set()
-        if existing:
-            old = IncomingMessage(chat_id=s.chat_id, message_id=s.message_id, text=existing["raw_text"],
-                                  date=s.date)
-            for o in self.parser.parse(old).signals:
-                if o.key == s.key:
-                    before = {f.action for f in o.management}
+        old = self._previous_version(s, existing)
+        before = {f.action for f in old.management} if old else set()
         return [f for f in s.management if f.action not in before]
 
     def _edit_cannot_trade(self, s: Signal, existing: dict | None) -> str | None:
@@ -307,6 +310,13 @@ class Pipeline:
         old_tps = [Decimal(t) for t in json.loads(existing["tps"])]
         management = self._new_management(s, existing)
         changed = not (old_sl == s.sl and old_tps == s.tp)
+        previous = self._previous_version(s, existing)
+        if UNCLEAR_TEXT in s.warnings and (previous is None or UNCLEAR_TEXT not in previous.warnings):
+            # "You can close now", "Closing this trade now" added to the post: not carried out, but never silent
+            self.storage.add_event("edit", "EDIT_UNCLEAR", signal_key=s.key)
+            await self.notifier.send(
+                f"⚠️ Каналът добави в сигнала {s.symbol} текст, който прилича на команда, но не го разбрах със "
+                f"сигурност. Не правя нищо по него, провери.\n\n{s.raw_text[:1000]}")
         if changed and management:
             # "TP1 hit ✅ 4485.10" next to changed numbers: which of them is a level is a guess, so none is moved
             self.storage.add_event("edit", "EDIT_IGNORED", "levels_and_management_text", signal_key=s.key)
@@ -329,9 +339,11 @@ class Pipeline:
             )
         elif not management:
             self.storage.add_event("edit", "NO_CHANGE", signal_key=s.key)
-            return
         for fu in management:  # "CANCELLED", "Close now", "move SL to BE" written into the post itself
             await self.handle_follow_up(fu, target=self.storage.get_signal(s.key))
+        if not (changed and management):  # refused levels stay refused: a later edit never applies them silently
+            # the next edit is compared with this version: a command handled now is not "new" again next time
+            self.storage.update_signal_text(s.key, s.raw_text)
 
     # -------------------------------------------------------- follow-ups
 
@@ -377,8 +389,9 @@ class Pipeline:
                 candidates = self.storage.open_signals_for_symbol(fu.chat_id, fu.symbol)
                 if not candidates and fu.action in INFO_ONLY:  # "SL hit" after the trade closed
                     candidates = self.storage.recent_signals_for_symbol(fu.chat_id, fu.symbol, since)[:1]
-            # "Close XAUUSD" + a new XAUUSD signal in one message: the command is never about that new signal
-            candidates = [c for c in candidates if c["message_id"] != fu.message_id]
+            # a command is only about a signal posted before it (channel message ids only grow): never the new
+            # signal of its own message, and never a trade opened after it (an edit hours later must not find one)
+            candidates = [c for c in candidates if c["message_id"] < fu.message_id]
         if not candidates:
             return None, "target_signal_not_found"
         if len(candidates) > 1:
@@ -392,6 +405,10 @@ class Pipeline:
             target = self.storage.get_signal(old["signal_key"]) if old and old["signal_key"] else None
             if old and (target is None or target["symbol"] == fu.symbol):
                 prev = old
+        if prev is None and fu.symbol is None:
+            # "Close 50% of XAUUSD now" edited to "Close 50% now": the same command, stored under its symbol
+            rows = self.storage.follow_ups_for(fu.chat_id, fu.message_id, fu.action.value)
+            prev = next((r for r in rows if not self._may_run_again(fu, r)), rows[0] if rows else None)
         return prev
 
     @staticmethod
@@ -413,10 +430,14 @@ class Pipeline:
                 await self.notifier.send(f"ℹ️ Каналът редактира команда {fu.action.value} (msg {fu.message_id}): "
                                          f"вече е обработена ({prev['status']}), не я повтарям.")
             return
+        problem = None
         if prev:
             self.storage.add_event("follow_up", "RETRY", prev["reason"], message_key=fkey)
-        problem = None
-        if target is None:
+            if target is None and prev["signal_key"]:
+                # a retry acts on the trade the command was about, never on one the symbol finds now
+                target = self.storage.get_signal(prev["signal_key"])
+                problem = None if target else "target_gone"
+        if target is None and problem is None:
             target, problem = self._resolve_target(fu)
         if target is None:
             self.storage.save_follow_up(fu, None, "REJECTED", problem)
@@ -484,10 +505,16 @@ class Pipeline:
     async def monitor_once(self) -> None:
         if self.client is None:
             return
-        opened, closed = await self.executor.sync()
+        async with self._lock:  # never between an order_send and its rows: a new position would look unknown
+            opened, closed = await self.executor.sync()
         for t in opened:
             kind = t.get("kind", "filled")
-            if kind == "recovered":
+            if kind == "untracked":
+                text = (f"⚠️ В MT5 има {t['what']} на бота, която ботът не следи: {t['instrument']} #{t['trade_id']}, "
+                        f"{t['units']} лота. Може да е поръчката без отговор ({t['client_ids']}), затова НЕ я отписвам "
+                        "като неизпълнена и мястото ѝ остава заето. Провери в MT5 и я затвори/отмени ръчно, ако не я "
+                        "искаш.")
+            elif kind == "recovered":
                 text = (f"✅ Поръчката без отговор е изпълнена в MT5: {t['instrument']} trade {t['trade_id']}, "
                         f"{t['units']} @ {t['price']}. Ботът я управлява.")
             elif kind == "recovered_closed":

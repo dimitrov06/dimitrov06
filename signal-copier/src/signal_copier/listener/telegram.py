@@ -3,9 +3,12 @@
 Restart safety: Telethon does not replay missed updates (catch_up=False), so at
 start the messages posted since the last stored one are fetched from history and
 handled in order with their real dates (old signals fail the age check, closes and
-cancels are applied); a gap that is too long or too old is only reported. Every
-message is deduplicated in SQLite, and edits of messages older than the start
-watermark that the bot never saw are ignored (they could resurrect old signals).
+cancels are applied); a gap that is too long or too old is only reported. The
+posts of signals that are still live are read again, so an edit made while the
+bot was down (CANCELLED, a new SL/TP) is handled too. Live events wait until all
+of this is done. Every message is deduplicated in SQLite, and edits of messages
+older than the start watermark that the bot never saw are ignored (they could
+resurrect old signals). A lost connection ends `run` with an error (restart).
 """
 
 from __future__ import annotations
@@ -107,6 +110,7 @@ class TelegramListener:
         self.notify = notify
         self.clock = clock
         self.watermarks: dict[int, int] = {}
+        self._held: list | None = None  # live events waiting for the catch-up at start
 
     async def _say(self, text: str) -> None:
         if self.notify is not None:
@@ -119,7 +123,7 @@ class TelegramListener:
         if not await self.client.is_user_authorized():
             raise ConfigError("Telegram session is not logged in. Run: python -m signal_copier login")
 
-        chat_ids, missed, names = [], [], []
+        chat_ids, missed, names, restarted = [], [], [], []
         for ch in self.channels:
             entity = await resolve_channel(self.client, ch, self.storage)
             chat_id = utils.get_peer_id(entity)
@@ -136,30 +140,74 @@ class TelegramListener:
             self.watermarks[chat_id] = max(latest_id, last or 0)
             if last and latest_id > last:
                 missed.append((chat_id, entity, last))
+            if last:
+                restarted.append((chat_id, entity))
             logger.info("listening", channel=str(ch), chat_id=chat_id, watermark=self.watermarks[chat_id])
         await self._say("👂 Следя: " + ", ".join(names))
+        # live events that arrive while the missed messages are handled wait for them, in arrival order: a "Close"
+        # replying to a missed signal must not run before that signal, an edit of a missed one must not be lost
+        self._held = []
 
         @self.client.on(events.NewMessage(chats=chat_ids))
         async def on_new(event):
-            if event.message.id <= self.watermarks.get(event.chat_id, 0):
-                return  # already existed before start
-            await self.on_message(to_incoming(event.chat_id, event.message, edited=False))
+            if self._held is not None:
+                self._held.append((event, False))
+                return
+            await self._live(event, edited=False)
 
         @self.client.on(events.MessageEdited(chats=chat_ids))
         async def on_edit(event):
-            m = event.message
-            if m.id <= self.watermarks.get(event.chat_id, 0) and not self._seen(event.chat_id, m.id):
-                logger.info("ignored_old_edit", chat_id=event.chat_id, message_id=m.id)
+            if self._held is not None:
+                self._held.append((event, True))
                 return
-            await self.on_message(to_incoming(event.chat_id, m, edited=True))
+            await self._live(event, edited=True)
 
-        for chat_id, entity, last in missed:  # handlers are on: anything newer arrives live meanwhile
-            await self._catch_up(chat_id, entity, last)
+        try:
+            for chat_id, entity, last in missed:
+                await self._catch_up(chat_id, entity, last)
+            for chat_id, entity in restarted:  # edits of live signal posts made while the bot was down
+                await self._recheck_live_posts(chat_id, entity)
+            while self._held:
+                event, edited = self._held.pop(0)
+                await self._live(event, edited)
+        finally:
+            self._held = None
 
         disconnected = asyncio.ensure_future(self.client.run_until_disconnected())
         stopped = asyncio.ensure_future(stop.wait())
-        await asyncio.wait({disconnected, stopped}, return_when=asyncio.FIRST_COMPLETED)
-        await self.client.disconnect()
+        try:
+            await asyncio.wait({disconnected, stopped}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stopped.cancel()
+            await self.client.disconnect()
+        if not stop.is_set():
+            # Telethon gave up reconnecting or the session ended: fail, so `run` tells the owner and starts again
+            # (returning normally would leave the bot running without reading the channel)
+            err = disconnected.exception() if disconnected.done() and not disconnected.cancelled() else None
+            raise ConnectionError(f"Telegram connection lost: {err!r}" if err else "Telegram connection lost") from err
+
+    async def _live(self, event, edited: bool) -> None:
+        m = event.message
+        if m.id <= self.watermarks.get(event.chat_id, 0):
+            if not edited:
+                return  # already existed before start (or handled by the catch-up)
+            if not self._seen(event.chat_id, m.id):
+                logger.info("ignored_old_edit", chat_id=event.chat_id, message_id=m.id)
+                return
+        await self.on_message(to_incoming(event.chat_id, m, edited=edited))
+
+    async def _recheck_live_posts(self, chat_id: int, entity) -> None:
+        """Posts of signals that still have an open trade or a pending order, read again: an edit made while the
+        bot was down ("CANCELLED" written into the post, a new SL/TP) is handled now like a live edit."""
+        ids = self.storage.live_signal_message_ids(chat_id)
+        if not ids:
+            return
+        for m in await self.client.get_messages(entity, ids=ids):
+            if m is None:  # deleted
+                continue
+            if (m.raw_text or "") != self.storage.latest_message_text(chat_id, m.id):
+                logger.info("edited_while_down", chat_id=chat_id, message_id=m.id)
+                await self.on_message(to_incoming(chat_id, m, edited=True))
 
     async def _catch_up(self, chat_id: int, entity, last: int) -> None:
         """Messages posted while the bot was down (after the last stored one, up to the start watermark)."""

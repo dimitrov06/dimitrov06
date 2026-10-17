@@ -208,12 +208,14 @@ class _SyncReads:
         self.ex = ex
         self.failed = False
         self._orders: dict | None = None
+        self.order_list: list = []  # every working order MT5 listed this round
         self._deals: dict | None = None
 
     async def orders(self) -> dict:
         if self._orders is None:
             try:
-                self._orders = {o.comment: o for o in await self.ex.client.read("orders_get")}
+                self.order_list = list(await self.ex.client.read("orders_get"))
+                self._orders = {o.comment: o for o in self.order_list}
             except Mt5Error as e:
                 logger.warning("mt5_sync_orders_failed", error=str(e))
                 self._orders, self.failed = {}, True
@@ -247,6 +249,7 @@ class Mt5Executor:
         # an order whose answer was lost (SENT) and that MT5 shows nowhere for this long is taken as never executed
         self.unknown_expiry = timedelta(minutes=unknown_expiry_minutes)
         self._unseen: dict[str, datetime] = {}  # client id -> since when MT5 has shown no trace of it
+        self._strays_reported: set[int] = set()  # untracked bot tickets the owner was already told about
         self.clock = lambda: datetime.now(timezone.utc)
 
     # ------------------------------------------------------------ helpers
@@ -748,7 +751,7 @@ class Mt5Executor:
                 continue
             if o["status"] == "SENT":
                 unseen.append(o)
-        opened += await self._expire_unseen(unseen, reads, now)
+        opened += await self._expire_unseen(unseen, reads, now, live)
 
         for t in self.storage.open_trades():
             if t["trade_id"] in by_ticket:
@@ -779,13 +782,15 @@ class Mt5Executor:
             return None
         return next((d for d in deals if d.entry == self.mt5.DEAL_ENTRY_IN), None)
 
-    async def _expire_unseen(self, rows: list[dict], reads: _SyncReads, now: datetime) -> list[dict]:
+    async def _expire_unseen(self, rows: list[dict], reads: _SyncReads, now: datetime, live: list) -> list[dict]:
         """SENT rows (answer lost) that MT5 shows nowhere: not a position, not a pending order, no opening deal.
 
         Only when every read of the round answered and the terminal is connected to the broker does a round count
         as "no trace"; after `unknown_expiry` of such rounds in a row the order is taken as never executed: FAILED,
         its max_open / per-symbol slot is free and the owner is told. A failed read or a disconnected terminal
         (whose lists may be stale) starts the wait again, so it can never expire an order by itself.
+        The search is by the comment tag, which a broker may change: while MT5 has a position or order of the bot
+        (magic) on that symbol that no row knows, it may be this order, so nothing of that symbol expires (notice).
         """
         ids = {o["client_id"] for o in rows}
         self._unseen = {cid: t for cid, t in self._unseen.items() if cid in ids}
@@ -796,10 +801,20 @@ class Mt5Executor:
             self._unseen.clear()
             return []
         out = []
-        for o in rows:
-            first = self._unseen.setdefault(o["client_id"], now)
-            if now - first < self.unknown_expiry:
-                continue
+        due = [o for o in rows if now - self._unseen.setdefault(o["client_id"], now) >= self.unknown_expiry]
+        strays = self._untracked(live, reads.order_list) if due else []
+        for kind, x, volume in strays:
+            waiting = [o["client_id"] for o in due if self.client.symbol(o["instrument"]) == x.symbol]
+            if waiting and x.ticket not in self._strays_reported:
+                self._strays_reported.add(x.ticket)
+                logger.warning("mt5_untracked_bot_ticket", ticket=x.ticket, symbol=x.symbol, waiting=waiting)
+                out.append({"kind": "untracked", "what": kind, "trade_id": str(x.ticket), "instrument": x.symbol,
+                            "units": volume, "client_ids": ", ".join(waiting), "signal_key": None})
+        blocked = {x.symbol for _, x, _ in strays}
+        for o in due:
+            if self.client.symbol(o["instrument"]) in blocked:
+                continue  # keeps waiting (SENT, slot taken) until the stray is gone or turns out to be it
+            first = self._unseen[o["client_id"]]
             del self._unseen[o["client_id"]]
             self.storage.update_order(o["client_id"], status="FAILED",
                                       response={"expired_unknown": now.isoformat(), "unseen_since": first.isoformat()})
@@ -809,6 +824,14 @@ class Mt5Executor:
                         "price": o["price"], "signal_key": o["signal_key"], "kind": "expired",
                         "minutes": int((now - first).total_seconds() // 60)})
         return out
+
+    def _untracked(self, live: list, orders: list) -> list[tuple[str, Any, Any]]:
+        """The bot's positions and working orders (magic) whose ticket no trade or order row knows."""
+        known = self.storage.known_tickets()
+        magic = self.client.cfg.magic
+        return ([("позиция", p, p.volume) for p in live if str(p.ticket) not in known]
+                + [("чакаща поръчка", o, o.volume_current) for o in orders
+                   if getattr(o, "magic", None) == magic and str(o.ticket) not in known])
 
     def _signal_failed_if_nothing_left(self, signal_key: str) -> None:
         """No order of the signal ever reached the market: it is not live (follow-ups, edits, slots)."""

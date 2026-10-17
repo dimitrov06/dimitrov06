@@ -46,6 +46,8 @@ class TpNotes:
     hit: bool = False  # a hit word in a TP line ("TP1 ✅ 4484.30" too)
     result: bool = False  # a TP line reports a hit ("Target Profit 1 @ 4484.30 ✅", "TP1 hit")
     plain: bool = False  # a TP line gives a level without any hit word
+    repeated: bool = False  # a label given a second, different level without a hit word ("TP1 @ x / TP1 @ y")
+    by_label: bool = False  # every level has a label and they are in label order (not as written)
 
 
 @dataclass
@@ -156,13 +158,16 @@ class SignalParser:
             if symbol is None:
                 result.issues.append(ParseIssue(reason="unknown_symbol", text=block))
                 return
-            signal_or_issue = self._build_signal(block, msg, symbol, Side(sides.pop()), sl, tps, signal_index)
+            signal_or_issue = self._build_signal(block, msg, symbol, Side(sides.pop()), sl, tps, tp_notes,
+                                                 signal_index)
             if isinstance(signal_or_issue, ParseIssue):
                 result.issues.append(signal_or_issue)
                 return
             if follow_ups or cmds.dropped:
                 signal_or_issue.warnings.append("contains_management_text")
                 signal_or_issue.management = follow_ups
+            if cmds.problems:  # command-like text that was left out ("You can close now"): told on an edit
+                signal_or_issue.warnings.append("unclear_management_text")
             if reported or updating:
                 signal_or_issue.warnings.append("contains_result_text")
             result.signals.append(signal_or_issue)
@@ -238,7 +243,7 @@ class SignalParser:
     # ---------------------------------------------------------------- signal
 
     def _build_signal(
-        self, block, msg, symbol, side: Side, sl, tps, index
+        self, block, msg, symbol, side: Side, sl, tps, tp_notes: TpNotes, index
     ) -> Signal | ParseIssue:
         warnings: list[str] = []
         if isinstance(sl, ParseIssue):
@@ -272,6 +277,11 @@ class SignalParser:
         if not tps:
             warnings.append("missing_tp")
 
+        if tp_notes.repeated:
+            return ParseIssue(reason="repeated_tp_label", text=block)  # "TP1 @ x / TP1 @ y": which one is TP2?
+        if tp_notes.by_label and len(tps) > 1 and tps != sorted(tps, reverse=side is Side.SELL):
+            # "TP2 @ 4484.30 / TP1 @ 4498.30" on a buy: the labels and the prices disagree on the last target
+            return ParseIssue(reason="tp_labels_out_of_order", text=block)
         problem = self._sanity_check(side, entry, sl, tps)
         if problem:
             return ParseIssue(reason=problem, text=block)
@@ -354,6 +364,8 @@ class SignalParser:
                 notes.hit = notes.hit or bool(hit)
                 if label is not None and label in labels:
                     notes.result = notes.result or bool(hit)
+                    if not hit and any(Decimal(n) not in {v for _, v in found} for n in NUMBER.findall(segment)):
+                        notes.repeated = True  # "Target Profit 1 @ 4498.30" again (TP2 copy-pasted?): not guessed
                     continue  # "TP1 hit ✅ 4485.10" under the TP1 line: a result, not a new level
                 if hit and NUMBER.search(segment[: hit.start()]) or hit and not NUMBER.search(segment):
                     notes.result = True  # "Target Profit 1 @ 4484.30 ✅", "TP1 hit"
@@ -369,6 +381,7 @@ class SignalParser:
                     labels.add(label)
         if found and all(label is not None for label, _ in found):
             found.sort(key=lambda x: x[0])
+            notes.by_label = True
         return [v for _, v in found], notes
 
     def _find_entry(self, block: str) -> tuple[Decimal | None, tuple[Decimal, Decimal] | None]:

@@ -58,7 +58,10 @@ class FakeTg:
     async def get_dialogs(self):
         return [NS(entity=e, name=t) for e, t in self.dialogs]
 
-    async def get_messages(self, entity, limit=None, min_id=0, reverse=False):
+    async def get_messages(self, entity, limit=None, min_id=0, reverse=False, ids=None):
+        if ids is not None:  # like Telethon: the current version of each, None for a deleted one
+            by_id = {m.id: m for m in self.history.get(entity.peer_id, [])}
+            return [by_id.get(i) for i in ids]
         msgs = sorted((m for m in self.history.get(entity.peer_id, []) if m.id > (min_id or 0)),
                       key=lambda m: m.id, reverse=not reverse)
         return msgs[:limit] if limit else msgs

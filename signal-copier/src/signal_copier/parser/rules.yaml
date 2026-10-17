@@ -75,6 +75,11 @@ macros:
   PCT: '(?<![\d.+\-(])(?P<percent>\d{1,3})(?![\d.])\s*(?:%|PERCENT\b)'
   # the rest of the sentence up to "at <price>" / "@ <price>"
   BEFORE_PRICE: '(?:(?!\bAT\b|@)[^\n.!?;])*?'
+  # the rest of the clause up to "at <price>": "Close XAUUSD now, 50% of the target reached" is a full close
+  BEFORE_SIZE: '(?:(?!\bAT\b|@)[^\n.!?;,])*?'
+  # CLOSE/EXIT right after SO / TOO / BE is never read as a command: "so close it now" may be one, or "Gold so close
+  # it could hit TP2". The word is then a command word outside any command: UNCERTAIN, the owner is told
+  NOT_AFTER_SO: '(?<!\bSO )(?<!\bTOO )(?<!\bBE )'
   # the rest of the sentence ("Close now. Re-enter at 4470" is two sentences)
   IN_SENTENCE: '[^\n.!?;]*?'
   # what may stand before a command at the start of a line: "‼️", "XAUUSD", "TP1 hit ✅", "Please"
@@ -89,21 +94,24 @@ macros:
 # Descriptive phrases that only look like commands ("very close to TP1", "weekly close above 4400", "exit strategy").
 # They are blanked out before commands are looked for, so they never become CLOSE and never make a message unclear.
 not_commands:
-  - '\b(?:IS|ARE|AM|WAS|WERE|BE|BEEN|BEING|GETTING|GET|GOT|VERY|SO|PRETTY|QUITE|REALLY|TOO|SUPER)\s+CLOSE\b'
-  - '\bCLOSE\s+(?:TO|ABOVE|BELOW|UNDER|OVER|ENOUGH|BY|CALL)\b'
-  - '\b(?:DAILY|WEEKLY|MONTHLY|YEARLY|MARKETS?|CANDLES?|DAY|SESSION|H1|H4|D1|W1|M15|M30|1H|4H|NY|LONDON|BAR)\s+CLOSES?\b'
-  - '\bCLOSES?\s+OF\s+THE\s+(?:CANDLE|DAY|WEEK|MONTH|MARKET|SESSION)\b'
-  - '\bEXIT\s+(?:STRATEGY|STRATEGIES|PLAN|POINTS?|LEVELS?|ZONE|TARGETS?|SIGNAL)\b'
+  # same line only: "Bearish H4" / "Close XAUUSD now" on the next line is a command
+  - '\b(?:IS|ARE|AM|WAS|WERE|BEEN|BEING|GETTING|GET|GOT|VERY|PRETTY|QUITE|REALLY|SUPER)[ \t]+(?:(?:SO|TOO|VERY|REALLY|PRETTY|QUITE|SUPER)[ \t]+)?CLOSE\b'
+  # "so close!", "too close to call", "SL will be close to entry"; "so close it now": see NOT_AFTER_SO
+  - '\b(?:SO|TOO|BE)[ \t]+CLOSE\b(?=[ \t]*(?:$|[.!?,;:)]|(?:TO|ABOVE|BELOW|UNDER|OVER|ENOUGH|BY|CALL)\b))'
+  - '\bCLOSE[ \t]+(?:TO|ABOVE|BELOW|UNDER|OVER|ENOUGH|BY|CALL)\b'
+  - '\b(?:DAILY|WEEKLY|MONTHLY|YEARLY|MARKETS?|CANDLES?|DAY|SESSION|H1|H4|D1|W1|M15|M30|1H|4H|NY|LONDON|BAR)[ \t]+CLOSES?\b'
+  - '\bCLOSES?[ \t]+OF[ \t]+THE[ \t]+(?:CANDLE|DAY|WEEK|MONTH|MARKET|SESSION)\b'
+  - '\bEXIT[ \t]+(?:STRATEGY|STRATEGIES|PLAN|POINTS?|LEVELS?|ZONE|TARGETS?|SIGNAL)\b'
 
 # Follow-up commands. Checked in this order; a matched action can suppress others.
 follow_ups:
   - action: CLOSE_PARTIAL
     patterns:
       # "Close AUDUSD 50% now", "close 30%": the size comes before the close price and is not a P/L ("14% profit")
-      - '\b(?:CLOSE|EXIT)\b{BEFORE_PRICE}{PCT}(?![ \t]*(?:PROFIT|GAIN|LOSS|UP|DOWN|ROI|RETURN)\b)'
+      - '{NOT_AFTER_SO}\b(?:CLOSE|EXIT)\b{BEFORE_SIZE}{PCT}(?![ \t]*(?:IN[ \t]+)?(?:THE[ \t]+)?(?:PROFIT|GAIN|LOSS|UP|DOWN|ROI|RETURN|GREEN|RED)\b)'
       - '\b(?:TAKE|SECURE|BOOK)\s+(?:PROFIT\s+(?:ON\s+|OF\s+)?)?{PCT}'      # "Secure 50% profit on XAUUSD"
-      - '\b(?:CLOSE|EXIT)\b{BEFORE_PRICE}\b(?:HALF|PARTIAL(?:LY)?|PARTIALS|1\s*/\s*2)\b'  # "Close AUDUSD partially at x"
-      - '\b(?:PARTIAL(?:LY)?|HALF)\s+(?:CLOSE|CLOSING|EXIT)\b'             # "Partially close AUDUSD now"
+      - '{NOT_AFTER_SO}\b(?:CLOSE|EXIT)\b{BEFORE_SIZE}\b(?:HALF|PARTIAL(?:LY)?|PARTIALS|1\s*/\s*2)\b'  # "Close AUDUSD partially at x"
+      - '\b(?:PARTIAL(?:LY)?|HALF)[ \t]+(?:CLOSE|CLOSING|EXIT)\b'          # "Partially close AUDUSD now"
       - '\b(?:TAKE|SECURE|BOOK)\s+(?:SOME\s+)?(?:PARTIALS?|HALF)\b'
     default_fraction: 0.5
     suppresses: [CLOSE]
@@ -137,9 +145,9 @@ follow_ups:
     patterns:
       # price = the channel's close price (for record-mode stats)
       - '{LEAD}(?:CLOSE|EXIT)\b{CMD_END}{IN_SENTENCE}(?:\bAT|@)[ \t]*{PRICE}'
-      - '\b(?:CLOSE|EXIT)[ \t]+{CLOSE_NOW}{IN_SENTENCE}(?:\bAT|@)[ \t]*{PRICE}'
+      - '{NOT_AFTER_SO}\b(?:CLOSE|EXIT)[ \t]+{CLOSE_NOW}{IN_SENTENCE}(?:\bAT|@)[ \t]*{PRICE}'
       - '{LEAD}(?:CLOSE|EXIT)\b{CMD_END}'
-      - '\b(?:CLOSE|EXIT)[ \t]+{CLOSE_NOW}'
+      - '{NOT_AFTER_SO}\b(?:CLOSE|EXIT)[ \t]+{CLOSE_NOW}'
 
 # Checked for every command except TP_HIT/SL_HIT, in the part of the message it is written in. A command caught by
 # one of them is not carried out: the message is UNCERTAIN and the owner is told (inside a signal post: left out).

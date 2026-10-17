@@ -87,6 +87,10 @@ class RiskManager:
         sl_distance = abs(entry_price - s.sl)
         if sl_distance == 0:
             return RiskDecision.reject("zero_sl_distance")
+        if ctx.quote_to_home <= 0:
+            # MT5 tick value 0 (symbol just selected, conversion rate not synced): the loss per lot is unknown, and
+            # with a commission set the size would come from the commission alone
+            return RiskDecision.reject("no_tick_value")
 
         spread = ctx.ask - ctx.bid
         max_spread = cfg.max_spread.get(s.symbol)

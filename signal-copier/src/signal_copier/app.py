@@ -42,12 +42,29 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
     return pipeline, client, notifier
 
 
+MONITOR_ALERT_AFTER = 3  # monitor rounds in a row that fail (MT5 terminal closed / not answering) before a notice
+MONITOR_RESTART_AFTER = 10  # ... before the bot restarts, which initializes MT5 again (about 5 min at 30 s)
+
+
 async def _monitor(pipeline: Pipeline, interval: int, stop: asyncio.Event) -> None:
+    failures = 0
     while not stop.is_set():
         try:
             await pipeline.monitor_once()
-        except Exception:
-            logger.exception("monitor_failed")
+        except Exception as e:
+            failures += 1
+            logger.exception("monitor_failed", rounds=failures)
+            if failures == MONITOR_ALERT_AFTER:
+                await pipeline.notifier.send(
+                    f"❗ Брокерът не отговаря ({failures} проверки подред): {e!r}. Не виждам изпълнения, затваряния и "
+                    "дневния стоп, и не мога да търгувам. Провери MT5 терминала; ако не се оправи, ботът ще се "
+                    "рестартира сам.")
+            if failures >= MONITOR_RESTART_AFTER:
+                raise RuntimeError(f"monitor failed {failures} rounds in a row: {e!r}") from e
+        else:
+            if failures >= MONITOR_ALERT_AFTER:
+                await pipeline.notifier.send("✅ Брокерът отговаря отново.")
+            failures = 0
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:
@@ -60,7 +77,13 @@ async def run(settings: Settings, secrets: Secrets) -> None:
     if not settings.telegram.channels:
         raise ConfigError("telegram.channels is empty in config.yaml")
 
-    pipeline, client, notifier = build_pipeline(settings, secrets)
+    try:
+        pipeline, client, notifier = build_pipeline(settings, secrets)
+    except ConfigError as e:  # e.g. an older custom parser.rules_file: the bot stops, so the owner must hear of it
+        notifier = Notifier(secrets.notify_bot_token, secrets.notify_chat_id)
+        await notifier.send(f"❗ signal-copier не стартира: {e}")
+        await notifier.aclose()
+        raise
     if isinstance(client, Mt5Client):
         try:  # also refuses a real account in paper mode, a demo account in live mode and a terminal that can't trade
             await client.connect()

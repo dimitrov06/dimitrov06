@@ -281,7 +281,9 @@ def test_sell_limit_edited_to_cancelled_is_cancelled(suffix):
     assert fake.orders == {}
     assert "отменена чакаща поръчка" in p.notifier.sent[-1]
     edit(p, XAUUSD_SELL_LIMIT + suffix + " ", 800, T0 + timedelta(minutes=21))  # edited again: runs once
-    assert events(p, "follow_up")[-1][0] == "DUPLICATE"
+    # the post's last handled version already had the cancel: it is not a new command, nothing runs again
+    assert [d for d, _ in events(p, "follow_up")] == ["EXECUTED"]
+    assert events(p, "edit")[-1][0] == "NO_CHANGE"
 
 
 def test_market_post_edited_to_close_now_closes():

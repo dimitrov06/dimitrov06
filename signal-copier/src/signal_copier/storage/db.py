@@ -182,6 +182,11 @@ class Storage:
                         " LIMIT 1", chat_id, message_id)
         return row["reply_to_msg_id"] if row else None
 
+    def latest_message_text(self, chat_id: int, message_id: int) -> str | None:
+        row = self._one("SELECT text FROM messages WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
+                        chat_id, message_id)
+        return row["text"] if row else None
+
     def message_posted_at(self, chat_id: int, message_id: int) -> datetime | None:
         """When the message was first seen with its post date (edits never move it later)."""
         row = self._one("SELECT MIN(date) AS d FROM messages WHERE chat_id=? AND message_id=?", chat_id, message_id)
@@ -204,6 +209,16 @@ class Storage:
             " ORDER BY date DESC",
             chat_id, symbol,
         )
+
+    def live_signal_message_ids(self, chat_id: int) -> list[int]:
+        """Posts of traded signals that still have an open trade or a pending/unknown order."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT message_id FROM signals WHERE chat_id=? AND status='EXECUTED' AND key IN"
+            " (SELECT signal_key FROM trades WHERE state='OPEN'"
+            "  UNION SELECT signal_key FROM orders WHERE status IN ('PENDING','SENT')) ORDER BY message_id",
+            (chat_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def recent_signals_for_symbol(self, chat_id: int, symbol: str, since: datetime) -> list[dict]:
         return self._all(
@@ -236,6 +251,10 @@ class Storage:
             (_s(sl), json.dumps([str(t) for t in tps]), _now(), key),
         )
 
+    def update_signal_text(self, key: str, raw_text: str) -> None:
+        """The post's latest handled version (an edit is compared with it, not with the first one)."""
+        self.conn.execute("UPDATE signals SET raw_text=?, updated_at=? WHERE key=?", (raw_text, _now(), key))
+
     # ------------------------------------------------------------ follow-ups
 
     @staticmethod
@@ -249,6 +268,11 @@ class Storage:
 
     def get_follow_up(self, key: str) -> dict | None:
         return self._one("SELECT * FROM follow_ups WHERE key=?", key)
+
+    def follow_ups_for(self, chat_id: int, message_id: int, action: str) -> list[dict]:
+        """Every row of this message and action, whatever symbol its key names."""
+        return self._all("SELECT * FROM follow_ups WHERE chat_id=? AND message_id=? AND action=? ORDER BY created_at",
+                         chat_id, message_id, action)
 
     def save_follow_up(self, fu: FollowUp, signal_key: str | None, status: str, reason: str | None = None) -> None:
         self.conn.execute(
@@ -300,6 +324,14 @@ class Storage:
 
     def orders_for_signal(self, signal_key: str) -> list[dict]:
         return self._all("SELECT * FROM orders WHERE signal_key=? ORDER BY part", signal_key)
+
+    def known_tickets(self) -> set[str]:
+        """Every broker ticket the bot has a row for (trades, pending orders, filled orders)."""
+        rows = self.conn.execute(
+            "SELECT trade_id FROM trades UNION SELECT oanda_order_id FROM orders WHERE oanda_order_id IS NOT NULL"
+            " UNION SELECT oanda_trade_id FROM orders WHERE oanda_trade_id IS NOT NULL"
+        ).fetchall()
+        return {str(r[0]) for r in rows}
 
     # ---------------------------------------------------------------- trades
 

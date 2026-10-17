@@ -35,8 +35,11 @@ async def _login(settings, secrets) -> None:
 
 async def _check(settings, secrets) -> None:
     from signal_copier.executor import OandaClient
+    from signal_copier.parser import ParserRules
 
     print(f"mode: {settings.mode.value}, broker: {settings.broker.value}")
+    ParserRules.load(settings.parser.rules_file)  # an older custom rules file stops `run`: say so here too
+    print(f"parser rules ok: {settings.parser.rules_file or 'built-in'}")
     if (mcreds := mt5_check_credentials(settings, secrets)) is not None:
         from signal_copier.executor.mt5 import Mt5Client
 
