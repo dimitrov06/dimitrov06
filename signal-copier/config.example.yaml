@@ -57,6 +57,8 @@ executor:
   retry_base_delay_s: 1.0
   request_timeout_s: 10
   pending_order_expiry_minutes: 240   # LIMIT/STOP orders expire after this
+  unknown_order_expiry_minutes: 10   # MT5: an order without answer that MT5 shows nowhere this long (all reads
+                                     # answered, terminal connected) is taken as never executed, frees its slot
   follow_up_symbol_lookback_hours: 24 # record mode: "AUDUSD close" without reply -> AUDUSD signal in this window
                                       # (paper/live: the one AUDUSD trade still open or pending, however old)
   monitor_interval_s: 30              # how often closed trades / filled limits are checked

@@ -197,10 +197,42 @@ class Mt5Client:
         return Decimal(str(tick.bid)), Decimal(str(tick.ask)), per_price_unit
 
 
+class _SyncReads:
+    """The reads one sync() round needs for SENT rows, each done at most once. A failed read (None / IPC error)
+    gives {} and sets `failed`: it can still not find anything, and it never proves that something is absent."""
+
+    def __init__(self, ex: Mt5Executor):
+        self.ex = ex
+        self.failed = False
+        self._orders: dict | None = None
+        self._deals: dict | None = None
+
+    async def orders(self) -> dict:
+        if self._orders is None:
+            try:
+                self._orders = {o.comment: o for o in await self.ex.client.read("orders_get")}
+            except Mt5Error as e:
+                logger.warning("mt5_sync_orders_failed", error=str(e))
+                self._orders, self.failed = {}, True
+        return self._orders
+
+    async def deals(self) -> dict:
+        """Opening deals of the last days by tag (deal times are server time: the window reaches past UTC now)."""
+        if self._deals is None:
+            now = datetime.now(timezone.utc)
+            try:
+                deals = await self.ex.client.read("history_deals_get", now - timedelta(days=3), now + timedelta(days=1))
+                self._deals = {d.comment: d for d in deals if d.entry == self.ex.mt5.DEAL_ENTRY_IN}
+            except Mt5Error as e:
+                logger.warning("mt5_sync_deals_failed", error=str(e))
+                self._deals, self.failed = {}, True
+        return self._deals
+
+
 class Mt5Executor:
     def __init__(self, client: Mt5Client, storage: Storage, retry_attempts: int = 4,
                  retry_base_delay_s: float = 1.0, pending_expiry_minutes: int = 240,
-                 tp_mode: str = "last", max_sl_deviation_pct: float = 10.0):
+                 tp_mode: str = "last", max_sl_deviation_pct: float = 10.0, unknown_expiry_minutes: int = 10):
         self.client = client
         self.mt5 = client.mt5
         self.storage = storage
@@ -209,6 +241,10 @@ class Mt5Executor:
         self.retry_base_delay_s = retry_base_delay_s
         self.pending_expiry = timedelta(minutes=pending_expiry_minutes)
         self.tp_mode = tp_mode
+        # an order whose answer was lost (SENT) and that MT5 shows nowhere for this long is taken as never executed
+        self.unknown_expiry = timedelta(minutes=unknown_expiry_minutes)
+        self._unseen: dict[str, datetime] = {}  # client id -> since when MT5 has shown no trace of it
+        self.clock = lambda: datetime.now(timezone.utc)
 
     # ------------------------------------------------------------ helpers
 
@@ -647,39 +683,55 @@ class Mt5Executor:
     # ------------------------------------------------------------ monitoring
 
     async def sync(self) -> tuple[list[dict], list[dict]]:
-        """Returns (adopted, closed). Adopted entries carry kind: filled | recovered | pending."""
+        """Returns (changes, closed). Changes carry kind: filled | recovered | recovered_closed | pending |
+        expired (an order without answer that MT5 never showed: marked FAILED, see _expire_unseen)."""
         opened, closed = [], []
         try:
             live = await self._positions()
         except Mt5Error as e:  # MT5 can't be asked: this round proves nothing about what is open
             logger.warning("mt5_sync_skipped", error=str(e))
+            self._unseen.clear()
             return opened, closed
         by_tag = {p.comment: p for p in live}
         by_ticket = {str(p.ticket): p for p in live}
-        live_orders = None
+        reads = _SyncReads(self)
+        now = self.clock()
+        since = (now - timedelta(days=3)).isoformat()
+        unseen = []
 
-        for o in self.storage.orders_with_status("PENDING", "SENT"):
+        # an order given up as never executed that shows up after all is adopted like any other
+        rows = self.storage.orders_with_status("PENDING", "SENT") + self.storage.orders_expired_unknown(since)
+        for o in rows:
             tag = short_tag(o["client_id"])
             p = by_tag.get(tag) or by_ticket.get(o["oanda_order_id"] or "")
             if p is not None:
+                self._unseen.pop(o["client_id"], None)
                 self._adopt(o, p)
                 opened.append({"trade_id": str(p.ticket), "instrument": o["instrument"], "units": p.volume,
                                "price": p.price_open, "signal_key": o["signal_key"],
                                "kind": "filled" if o["status"] == "PENDING" else "recovered"})
                 continue
-            if o["status"] != "SENT":
+            if o["status"] == "PENDING":
                 continue
-            if live_orders is None:  # a SENT row whose answer was lost may be a working pending order
-                try:
-                    live_orders = {x.comment: x for x in await self.client.read("orders_get")}
-                except Mt5Error:
-                    live_orders = {}
-            po = live_orders.get(tag)
+            # a SENT row whose answer was lost may be a working pending order, or filled and closed already
+            po = (await reads.orders()).get(tag)
             if po is not None:
+                self._unseen.pop(o["client_id"], None)
                 self.storage.update_order(o["client_id"], status="PENDING", oanda_order_id=str(po.ticket))
                 self._signal_live(o["signal_key"])
                 opened.append({"trade_id": str(po.ticket), "instrument": o["instrument"], "units": po.volume_current,
                                "price": po.price_open, "signal_key": o["signal_key"], "kind": "pending"})
+                continue
+            d = (await reads.deals()).get(tag)
+            if d is not None:  # its position is not live (it would be in by_tag): opened and closed again
+                self._unseen.pop(o["client_id"], None)
+                self._adopt(o, NS(ticket=d.position_id, volume=d.volume, price_open=d.price))
+                opened.append({"trade_id": str(d.position_id), "instrument": o["instrument"], "units": d.volume,
+                               "price": d.price, "signal_key": o["signal_key"], "kind": "recovered_closed"})
+                continue
+            if o["status"] == "SENT":
+                unseen.append(o)
+        opened += await self._expire_unseen(unseen, reads, now)
 
         for t in self.storage.open_trades():
             if t["trade_id"] in by_ticket:
@@ -700,3 +752,43 @@ class Mt5Executor:
             self.storage.close_trade(t["trade_id"], close_price, pl, closed_at)
             closed.append({**t, "realized_pl": str(pl), "close_price": str(close_price)})
         return opened, closed
+
+    async def _expire_unseen(self, rows: list[dict], reads: _SyncReads, now: datetime) -> list[dict]:
+        """SENT rows (answer lost) that MT5 shows nowhere: not a position, not a pending order, no opening deal.
+
+        Only when every read of the round answered and the terminal is connected to the broker does a round count
+        as "no trace"; after `unknown_expiry` of such rounds in a row the order is taken as never executed: FAILED,
+        its max_open / per-symbol slot is free and the owner is told. A failed read or a disconnected terminal
+        (whose lists may be stale) starts the wait again, so it can never expire an order by itself.
+        """
+        ids = {o["client_id"] for o in rows}
+        self._unseen = {cid: t for cid, t in self._unseen.items() if cid in ids}
+        if not rows:
+            return []
+        term = await self.client.call("terminal_info")
+        if reads.failed or term is None or not term.connected:
+            self._unseen.clear()
+            return []
+        out = []
+        for o in rows:
+            first = self._unseen.setdefault(o["client_id"], now)
+            if now - first < self.unknown_expiry:
+                continue
+            del self._unseen[o["client_id"]]
+            self.storage.update_order(o["client_id"], status="FAILED",
+                                      response={"expired_unknown": now.isoformat(), "unseen_since": first.isoformat()})
+            self._signal_failed_if_nothing_left(o["signal_key"])
+            logger.warning("mt5_unknown_order_expired", client_id=o["client_id"], unseen_since=first.isoformat())
+            out.append({"trade_id": o["client_id"], "instrument": o["instrument"], "units": abs(Decimal(o["units"])),
+                        "price": o["price"], "signal_key": o["signal_key"], "kind": "expired",
+                        "minutes": int((now - first).total_seconds() // 60)})
+        return out
+
+    def _signal_failed_if_nothing_left(self, signal_key: str) -> None:
+        """No order of the signal ever reached the market: it is not live (follow-ups, edits, slots)."""
+        orders = self.storage.orders_for_signal(signal_key)
+        if any(o["status"] in ("PENDING_SEND", "SENT", "PENDING", "FILLED") for o in orders):
+            return
+        sig = self.storage.get_signal(signal_key)
+        if sig is not None and sig["status"] == "EXECUTED":
+            self.storage.set_signal_status(signal_key, "FAILED", "unknown_order_expired")

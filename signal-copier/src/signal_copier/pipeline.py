@@ -480,9 +480,19 @@ class Pipeline:
             if kind == "recovered":
                 text = (f"✅ Поръчката без отговор е изпълнена в MT5: {t['instrument']} trade {t['trade_id']}, "
                         f"{t['units']} @ {t['price']}. Ботът я управлява.")
+            elif kind == "recovered_closed":
+                text = (f"✅ Поръчката без отговор е била изпълнена в MT5 и вече е затворена: {t['instrument']} "
+                        f"trade {t['trade_id']}, {t['units']} @ {t['price']}.")
             elif kind == "pending":
                 text = (f"⏳ Поръчката без отговор е чакаща в MT5: {t['instrument']} #{t['trade_id']}, "
                         f"{t['units']} @ {t['price']}. Ботът я управлява.")
+            elif kind == "expired":
+                self.storage.add_event("execute", "UNKNOWN_EXPIRED", signal_key=t["signal_key"],
+                                       data={"client_id": t["trade_id"], "minutes": t["minutes"]})
+                text = (f"⌛ Поръчката без отговор {t['instrument']} ({t['units']} лота, {t['trade_id']}) не се появи "
+                        f"в MT5 за {t['minutes']} мин (проверени позиции, чакащи поръчки и сделки). Приемам, че НЕ е "
+                        "изпълнена: отбелязвам я като неуспешна и освобождавам мястото ѝ. Ако все пак се появи в MT5, "
+                        "ботът ще я поеме.")
             else:
                 text = f"✅ Изпълнена чакаща поръчка {t['instrument']}: {t['units']} @ {t['price']}"
                 if self.storage.get_state("halt_day") == self._today():

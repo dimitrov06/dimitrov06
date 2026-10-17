@@ -283,6 +283,11 @@ class Storage:
         marks = ",".join("?" * len(statuses))
         return self._all(f"SELECT * FROM orders WHERE status IN ({marks})", *statuses)
 
+    def orders_expired_unknown(self, since: str) -> list[dict]:
+        """Orders without answer that were given up as never executed (FAILED by the monitor) since `since`."""
+        return self._all("SELECT * FROM orders WHERE status='FAILED' AND response LIKE '%\"expired_unknown\"%'"
+                         " AND updated_at>=?", since)
+
     def orders_for_signal(self, signal_key: str) -> list[dict]:
         return self._all("SELECT * FROM orders WHERE signal_key=? ORDER BY part", signal_key)
 

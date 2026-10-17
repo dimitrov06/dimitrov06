@@ -84,6 +84,9 @@ class ExecutorCfg(BaseModel):
     retry_base_delay_s: float = 1.0
     request_timeout_s: float = 10.0
     pending_order_expiry_minutes: int = 240
+    # MT5: an order whose answer was lost and that MT5 shows nowhere (positions, pending orders, deals; every read
+    # answered, terminal connected) for this long is taken as never executed and frees its slot
+    unknown_order_expiry_minutes: int = 10
     follow_up_symbol_lookback_hours: int = 24
     monitor_interval_s: int = 30
 

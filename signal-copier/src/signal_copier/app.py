@@ -36,7 +36,8 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
     elif (mcreds := mt5_credentials(settings, secrets)) is not None:
         client = Mt5Client(mcreds, settings.mt5)
         executor = Mt5Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s,
-                               ex.pending_order_expiry_minutes, ex.tp_split, settings.parser.max_price_deviation_pct)
+                               ex.pending_order_expiry_minutes, ex.tp_split, settings.parser.max_price_deviation_pct,
+                               ex.unknown_order_expiry_minutes)
     pipeline = Pipeline(settings, storage, parser, notifier, RiskManager(settings.risk), client, executor)
     return pipeline, client, notifier
 

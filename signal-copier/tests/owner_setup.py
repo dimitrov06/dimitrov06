@@ -59,7 +59,8 @@ def make(fake, **risk) -> Pipeline:
     storage = Storage(":memory:")
     ex = settings.executor
     executor = Mt5Executor(client, storage, ex.retry_attempts, ex.retry_base_delay_s,
-                           ex.pending_order_expiry_minutes, ex.tp_split, settings.parser.max_price_deviation_pct)
+                           ex.pending_order_expiry_minutes, ex.tp_split, settings.parser.max_price_deviation_pct,
+                           ex.unknown_order_expiry_minutes)
     clock = {"t": NOW}
     p = Pipeline(settings, storage, SignalParser(), Notifier(None, None), RiskManager(settings.risk), client,
                  executor, clock=lambda: clock["t"])
