@@ -117,9 +117,17 @@ class TelegramListener:
             await self.notify(text)
 
     async def run(self, stop: asyncio.Event) -> None:
+        await self.client.connect()
+        try:
+            await self._listen(stop)
+        finally:
+            # also after an error at start (catch-up, re-check of live posts): Telethon commits and closes its
+            # session file only here, and the restart opens a new client on the same file
+            await self.client.disconnect()
+
+    async def _listen(self, stop: asyncio.Event) -> None:
         from telethon import events, utils
 
-        await self.client.connect()
         if not await self.client.is_user_authorized():
             raise ConfigError("Telegram session is not logged in. Run: python -m signal_copier login")
 
@@ -179,7 +187,6 @@ class TelegramListener:
             await asyncio.wait({disconnected, stopped}, return_when=asyncio.FIRST_COMPLETED)
         finally:
             stopped.cancel()
-            await self.client.disconnect()
         if not stop.is_set():
             # Telethon gave up reconnecting or the session ended: fail, so `run` tells the owner and starts again
             # (returning normally would leave the bot running without reading the channel)

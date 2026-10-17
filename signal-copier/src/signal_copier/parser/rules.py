@@ -123,8 +123,16 @@ class ParserRules:
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> ParserRules:
-        with open(path or DEFAULT_RULES_PATH, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        """A file that cannot be used (missing, not YAML, a bad regex, an older version) is a ConfigError: the bot
+        stops and tells the owner instead of restarting forever without a word."""
+        where = path or DEFAULT_RULES_PATH
+        try:
+            with open(where, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as e:
+            raise ConfigError(f"parser rules {where} cannot be read: {e}") from e
+        if not isinstance(data, dict):
+            raise ConfigError(f"parser rules {where} is not a YAML mapping of rules")
         missing = [k for k in SAFETY_KEYS if not data.get(k)]
         missing += [f"command_guards.{k}" for k in GUARD_KEYS if not (data.get("command_guards") or {}).get(k)]
         if missing:
@@ -133,4 +141,7 @@ class ParserRules:
                 f"parser rules {path or DEFAULT_RULES_PATH} lack {', '.join(missing)}: the file is older than this "
                 "version. Copy the built-in src/signal_copier/parser/rules.yaml and add your changes to it again."
             )
-        return cls(RulesFile.model_validate(data))
+        try:
+            return cls(RulesFile.model_validate(data))
+        except (ValueError, TypeError, AttributeError, re.error) as e:  # pydantic errors are ValueErrors
+            raise ConfigError(f"parser rules {where} are invalid: {e}") from e

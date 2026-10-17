@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS signals_msg ON signals (chat_id, message_id);
 CREATE INDEX IF NOT EXISTS signals_symbol ON signals (chat_id, symbol, date);
 CREATE TABLE IF NOT EXISTS follow_ups (
-    key TEXT PRIMARY KEY,          -- chat:message:action[:symbol]
+    key TEXT PRIMARY KEY,          -- chat:message:action[:symbol][>signal key, or >message]
     chat_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
     action TEXT NOT NULL,
@@ -274,13 +274,15 @@ class Storage:
         return self._all("SELECT * FROM follow_ups WHERE chat_id=? AND message_id=? AND action=? ORDER BY created_at",
                          chat_id, message_id, action)
 
-    def save_follow_up(self, fu: FollowUp, signal_key: str | None, status: str, reason: str | None = None) -> None:
+    def save_follow_up(self, fu: FollowUp, signal_key: str | None, status: str, reason: str | None = None,
+                       key: str | None = None) -> None:
+        """key: the row, when not follow_up_key(fu) (two commands of one message with the same key)."""
         self.conn.execute(
             """INSERT INTO follow_ups (key, chat_id, message_id, action, signal_key, price, fraction, tp_index, date,
                    status, reason, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(key) DO UPDATE SET signal_key=excluded.signal_key, status=excluded.status,
                    reason=excluded.reason, price=excluded.price, fraction=excluded.fraction""",
-            (self.follow_up_key(fu), fu.chat_id, fu.message_id, fu.action.value, signal_key, _s(fu.price),
+            (key or self.follow_up_key(fu), fu.chat_id, fu.message_id, fu.action.value, signal_key, _s(fu.price),
              _s(fu.fraction), fu.tp_index, fu.date.isoformat(), status, reason, _now()),
         )
 

@@ -35,6 +35,13 @@ CLOSE_PRICE = re.compile(r"(?:\bAT|@)[ \t]*\d+(?:\.\d+)?(?![\d:])")
 CLOSE_SIZE = re.compile(r"\b1\s*/\s*2\b|\b\d{1,3}\s*PERCENT\b")
 COMMAND_NOW = re.compile(r"[ \t]*(?:NOW|IMMEDIATELY|ASAP)\b")
 BRACKET_PERCENT = re.compile(r"\((?![^)]*[+\-])[^)]*(?<![\d.])\d{1,3}\s*%")  # "(43%)", not "(+1.43%)" / "(1.43%)"
+# a size after a full close in its sentence that the partial close did not take: "Close XAUUSD now, half position",
+# "Close XAUUSD, 50% now" (a partial close?) or "Close XAUUSD now, 50% of the target reached" (a note?): not guessed.
+# A P/L ("2% in profit", "(+0.50%)") is no size
+SIZE_AFTER_CLOSE = re.compile(
+    r"(?<![\d.+\-(])\d{1,3}(?![\d.])\s*(?:%|PERCENT\b)"
+    r"(?![ \t]*(?:IN[ \t]+)?(?:THE[ \t]+)?(?:PROFIT|GAIN|LOSS|UP|DOWN|ROI|RETURN|GREEN|RED)\b)"
+    r"|\b(?:HALF|PARTIAL(?:LY)?|PARTIALS|1\s*/\s*2)\b")
 PRICE_OR_ZONE = re.compile(rf"(?P<a>{NUM})(?:[ \t]*(?:-|/|~|\bTO\b)[ \t]*(?P<b>{NUM}))?")
 NUMBER = re.compile(NUM)
 DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−"), "-")
@@ -485,7 +492,10 @@ class SignalParser:
                         cmds.problems.append(problem)
                         continue
                     fu = self._follow_up(rule, m, msg, symbol)
-                    if fu is not None and fu.action in CLOSE_ACTIONS and self._unexplained_numbers(text, m, fu.action):
+                    if fu is not None and fu.action in CLOSE_ACTIONS and (
+                            self._unexplained_numbers(text, m, fu.action)
+                            or rule.action is FollowUpAction.CLOSE and FollowUpAction.CLOSE not in suppressed
+                            and SIZE_AFTER_CLOSE.search(self._rest_of_sentence(text, m))):
                         left_out = True
                         cmds.problems.append("unclear_close_command")
                         fu = None
@@ -567,6 +577,12 @@ class SignalParser:
         start = max((b.end() for b in SENTENCE_END.finditer(text, 0, m.start())), default=0)
         end = SENTENCE_END.search(text, m.end())
         return text[start: end.start() if end else len(text)]
+
+    @staticmethod
+    def _rest_of_sentence(text: str, m: re.Match) -> str:
+        """From the command word to the end of its sentence."""
+        end = SENTENCE_END.search(text, m.end())
+        return text[m.start(): end.start() if end else len(text)]
 
     def _unexplained_numbers(self, text: str, m: re.Match, action: FollowUpAction) -> bool:
         """A close whose sentence has numbers besides the close price, the size and P/L notes: "Close at 23:00".

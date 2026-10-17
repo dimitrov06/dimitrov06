@@ -37,6 +37,12 @@ def _fmt_tps(tps: list[Decimal]) -> str:
     return ", ".join(map(str, tps)) or "няма"
 
 
+def _command_id(f: FollowUp) -> tuple:
+    """Two versions of a post have the same command: the same action, and for "move SL to <price>" the same price
+    (a corrected price is a new command; the price quoted on a close is only a note)."""
+    return f.action, f.price if f.action is FollowUpAction.MOVE_SL else None
+
+
 def _fmt_signal(s: Signal) -> str:
     entry = s.entry.type.value
     if s.entry.price is not None:
@@ -251,12 +257,18 @@ class Pipeline:
         return next((o for o in self.parser.parse(old).signals if o.key == s.key), None)
 
     def _new_management(self, s: Signal, existing: dict | None) -> list[FollowUp]:
-        """Commands the edit wrote into the signal block that the earlier version did not have."""
+        """Commands the edit wrote into the signal block that the last handled version did not have, and commands
+        of the post that may run again: a close/cancel/SL move that failed (❗) or a corrected SL price."""
         if not s.management:
             return []
         old = self._previous_version(s, existing)
-        before = {f.action for f in old.management} if old else set()
-        return [f for f in s.management if f.action not in before]
+        before = {_command_id(f) for f in old.management} if old else set()
+        new = []
+        for f in s.management:
+            prev = self._previous_follow_up(f, existing) if existing and _command_id(f) in before else None
+            if _command_id(f) not in before or (prev is not None and self._may_run_again(f, prev)):
+                new.append(f)
+        return new
 
     def _edit_cannot_trade(self, s: Signal, existing: dict | None) -> str | None:
         """Why an edited, not yet traded signal must not be traded now (None: evaluate it like a new one)."""
@@ -398,16 +410,37 @@ class Pipeline:
             return None, "ambiguous_target"
         return candidates[0], None
 
-    def _previous_follow_up(self, fu: FollowUp) -> dict | None:
-        prev = self.storage.get_follow_up(self.storage.follow_up_key(fu))
+    @staticmethod
+    def _same_command(fu: FollowUp, target: dict | None, row: dict) -> bool:
+        """Whether a stored row is this command. One message can hold two with the same key: "Close XAUUSD" for an
+        older trade and "Close now" written under the new XAUUSD signal of the same post (target). A command
+        written into a signal's post is only ever about that signal; any other is never about a signal of its own
+        message (see _resolve_target)."""
+        if target is not None:
+            return row["signal_key"] == target["key"]
+        return not (row["signal_key"] or "").startswith(f"{fu.chat_id}:{fu.message_id}:")
+
+    def _command_key(self, fu: FollowUp, target: dict | None) -> str:
+        """The row of this command: the usual key, unless the other command of the message already holds it."""
+        key = self.storage.follow_up_key(fu)
+        row = self.storage.get_follow_up(key)
+        if row is None or self._same_command(fu, target, row):
+            return key
+        return f"{key}>{target['key']}" if target is not None else f"{key}>message"
+
+    def _previous_follow_up(self, fu: FollowUp, target: dict | None = None) -> dict | None:
+        prev = self.storage.get_follow_up(self._command_key(fu, target))
         if prev is None and fu.symbol is not None:  # written before the symbol was part of the key
             old = self.storage.get_follow_up(self.storage.follow_up_key(fu, legacy=True))
-            target = self.storage.get_signal(old["signal_key"]) if old and old["signal_key"] else None
-            if old and (target is None or target["symbol"] == fu.symbol):
+            old_target = self.storage.get_signal(old["signal_key"]) if old and old["signal_key"] else None
+            if old and self._same_command(fu, target, old) and (old_target is None
+                                                                or old_target["symbol"] == fu.symbol):
                 prev = old
         if prev is None and fu.symbol is None:
-            # "Close 50% of XAUUSD now" edited to "Close 50% now": the same command, stored under its symbol
-            rows = self.storage.follow_ups_for(fu.chat_id, fu.message_id, fu.action.value)
+            # "Close 50% of XAUUSD now" edited to "Close 50% now": the same command, stored under its symbol. A
+            # rejected row did nothing: "Cancel Pending Order on AUDUSD" corrected to "Cancel Pending Order" runs
+            rows = [r for r in self.storage.follow_ups_for(fu.chat_id, fu.message_id, fu.action.value)
+                    if r["status"] != "REJECTED" and self._same_command(fu, target, r)]
             prev = next((r for r in rows if not self._may_run_again(fu, r)), rows[0] if rows else None)
         return prev
 
@@ -422,8 +455,8 @@ class Pipeline:
 
     async def handle_follow_up(self, fu: FollowUp, target: dict | None = None) -> None:
         """target: the signal, when the command was written into that signal's own post (an edit)."""
-        fkey = self.storage.follow_up_key(fu)
-        prev = self._previous_follow_up(fu)
+        fkey = self._command_key(fu, target)
+        prev = self._previous_follow_up(fu, target)
         if prev and not self._may_run_again(fu, prev):
             self.storage.add_event("follow_up", "DUPLICATE", message_key=fkey)
             if fu.edited:  # e.g. the channel edited its "close" message: never close twice, but say so
@@ -440,7 +473,7 @@ class Pipeline:
         if target is None and problem is None:
             target, problem = self._resolve_target(fu)
         if target is None:
-            self.storage.save_follow_up(fu, None, "REJECTED", problem)
+            self.storage.save_follow_up(fu, None, "REJECTED", problem, key=fkey)
             self.storage.add_event("follow_up", "REJECTED", problem, message_key=fkey)
             await self.notifier.send(f"⚠️ Команда {fu.action.value} без ясна сделка ({problem}). Не правя нищо.\n\n"
                                      f"{fu.raw_text[:500]}")
@@ -449,12 +482,12 @@ class Pipeline:
         key = target["key"]
         label = f"{fu.action.value} за {target['symbol']} {target['side']} (msg {target['message_id']})"
         if fu.action in INFO_ONLY:
-            self.storage.save_follow_up(fu, key, "RECORDED")
+            self.storage.save_follow_up(fu, key, "RECORDED", key=fkey)
             self.storage.add_event("follow_up", "RECORDED", signal_key=key, message_key=fkey)
             await self.notifier.send(f"ℹ️ Каналът съобщава {label}")
             return
         if self.mode is Mode.RECORD or target["status"] != "EXECUTED":
-            self.storage.save_follow_up(fu, key, "RECORDED")
+            self.storage.save_follow_up(fu, key, "RECORDED", key=fkey)
             self.storage.add_event("follow_up", "RECORDED", signal_key=key, message_key=fkey,
                                    data={"price": fu.price, "fraction": fu.fraction})
             await self.notifier.send(f"📝 Записано: {label}" + (f" @ {fu.price}" if fu.price else ""))
@@ -464,13 +497,13 @@ class Pipeline:
             done = await self.executor.apply_follow_up(fu, key, info)
         except Exception as e:
             logger.exception("follow_up_failed", follow_up=fkey)
-            self.storage.save_follow_up(fu, key, "FAILED", repr(e))
+            self.storage.save_follow_up(fu, key, "FAILED", repr(e), key=fkey)
             self.storage.add_event("follow_up", "FAILED", repr(e), signal_key=key, message_key=fkey)
             await self.notifier.send(f"❗ Грешка при {label}: {e!r}")
             return
         waiting = any(isinstance(d, Waiting) for d in done)
         status = "WAITING" if waiting else "EXECUTED"
-        self.storage.save_follow_up(fu, key, status, None if done else "nothing_to_do")
+        self.storage.save_follow_up(fu, key, status, None if done else "nothing_to_do", key=fkey)
         self.storage.add_event("follow_up", status, signal_key=key, message_key=fkey, data=done)
         await self.notifier.send(f"🔧 {label}:\n" + ("\n".join(done) if done else "няма отворени сделки/поръчки"))
 

@@ -32,6 +32,7 @@ class Notifier:
             transport=transport,
         )
         self.sent: list[str] = []  # kept for tests / debugging
+        self.failed = 0  # messages the Bot API did not take (network down, wrong token)
         self._queue: asyncio.Queue[str] | None = None
         self._worker: asyncio.Task | None = None
 
@@ -68,8 +69,10 @@ class Notifier:
                                                           "disable_web_page_preview": True},
                                      timeout=SEND_TIMEOUT_S)
             if r.status_code != 200:
+                self.failed += 1
                 logger.error("notify_failed", status=r.status_code, body=r.text[:300])
         except Exception as e:  # never raises: httpx errors, timeouts, anything
+            self.failed += 1
             logger.error("notify_failed", error=repr(e))
 
     async def poll_commands(self, handler: CommandHandler, stop: asyncio.Event) -> None:

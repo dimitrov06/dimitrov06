@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import signal as os_signal
+from datetime import datetime, timedelta, timezone
 
 from signal_copier import log
 from signal_copier.executor import Executor, OandaClient
@@ -20,9 +22,10 @@ logger = log.get("app")
 
 
 def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, OandaClient | None, Notifier]:
+    rules = ParserRules.load(settings.parser.rules_file)  # a refused rules file leaves no database open
     storage = Storage(settings.storage.sqlite_path)
     parser = SignalParser(
-        ParserRules.load(settings.parser.rules_file),
+        rules,
         bare_price_entry=settings.parser.bare_price_entry,
         max_price_deviation_pct=settings.parser.max_price_deviation_pct,
     )
@@ -40,6 +43,41 @@ def build_pipeline(settings: Settings, secrets: Secrets) -> tuple[Pipeline, Oand
                                ex.unknown_order_expiry_minutes)
     pipeline = Pipeline(settings, storage, parser, notifier, RiskManager(settings.risk), client, executor)
     return pipeline, client, notifier
+
+
+STARTUP_ERROR_KEY = "startup_error_reported"  # state: the config error last sent to the owner, and when
+STARTUP_ERROR_REMIND = timedelta(hours=24)
+
+
+async def _tell_startup_error(notifier: Notifier, sqlite_path: str, e: ConfigError,
+                              storage: Storage | None = None) -> None:
+    """A config error stops the bot (exit 2), and whatever starts it again (the Task Scheduler .bat, systemd) hits
+    the same error seconds later: it is sent once, and again once a day while it lasts. Closes the notifier."""
+    text = f"❗ signal-copier не стартира: {e}"
+    now = datetime.now(timezone.utc)
+    own = None
+    told = False
+    try:
+        if storage is None:
+            storage = own = Storage(sqlite_path)
+        last = json.loads(storage.get_state(STARTUP_ERROR_KEY) or "null")
+        told = bool(last) and last["text"] == text and now - datetime.fromisoformat(last["at"]) < STARTUP_ERROR_REMIND
+    except Exception:  # the database is not usable: tell the owner every time rather than never
+        logger.exception("startup_error_state_unavailable")
+        storage = None
+    try:
+        if told:
+            logger.error("startup_error_already_reported", error=str(e))
+            return
+        await notifier.send(text + "\nБотът е спрян. При рестарт със същата грешка не го повтарям, напомням веднъж "
+                                   "на ден.")
+        await notifier.aclose()  # waits for the Bot API: only a message that went out counts as told
+        if storage is not None and not getattr(notifier, "failed", 0):
+            storage.set_state(STARTUP_ERROR_KEY, json.dumps({"text": text, "at": now.isoformat()}))
+    finally:
+        await notifier.aclose()
+        if own is not None:
+            own.close()
 
 
 MONITOR_ALERT_AFTER = 3  # monitor rounds in a row that fail (MT5 terminal closed / not answering) before a notice
@@ -79,20 +117,23 @@ async def run(settings: Settings, secrets: Secrets) -> None:
 
     try:
         pipeline, client, notifier = build_pipeline(settings, secrets)
-    except ConfigError as e:  # e.g. an older custom parser.rules_file: the bot stops, so the owner must hear of it
-        notifier = Notifier(secrets.notify_bot_token, secrets.notify_chat_id)
-        await notifier.send(f"❗ signal-copier не стартира: {e}")
-        await notifier.aclose()
+    except ConfigError as e:  # e.g. a refused custom parser.rules_file: the bot stops, so the owner must hear of it
+        await _tell_startup_error(Notifier(secrets.notify_bot_token, secrets.notify_chat_id),
+                                  settings.storage.sqlite_path, e)
         raise
     if isinstance(client, Mt5Client):
         try:  # also refuses a real account in paper mode, a demo account in live mode and a terminal that can't trade
             await client.connect()
         except Exception as e:
-            await notifier.send(f"❗ signal-copier не стартира: {e}")
-            await notifier.aclose()
+            if isinstance(e, ConfigError):  # exit 2: told once, not on every start of the .bat
+                await _tell_startup_error(notifier, settings.storage.sqlite_path, e, pipeline.storage)
+            else:  # restarted in-process with growing delays
+                await notifier.send(f"❗ signal-copier не стартира: {e}")
+                await notifier.aclose()
             await client.aclose()  # the restart loop builds everything again
             pipeline.storage.close()
             raise
+    pipeline.storage.set_state(STARTUP_ERROR_KEY, None)  # started: the next config error is news again
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGINT, os_signal.SIGTERM):

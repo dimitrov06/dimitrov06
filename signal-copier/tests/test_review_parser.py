@@ -2,7 +2,8 @@
 
 - a real close or BE after "so" or after a line ending in a description word is never dropped without a notice
   (P1-not-commands-blank-real-commands-silently);
-- a full close with a stray percent or "half" in another clause is a full close (P2-full-close-read-as-partial);
+- a full close with a stray percent or "half" in another clause is never a partial close, and never a silent full
+  close either: it is UNCERTAIN (P2-full-close-read-as-partial, before-size-comma-turns-partial-into-full-close);
 - a repeated TP label or labels against the prices are not guessed (P3-duplicate-tp-label-drops-tp2).
 """
 
@@ -95,20 +96,33 @@ def test_description_with_so_or_be_close_stays_chatter(text):
 
 @pytest.mark.parametrize("text", [
     "Close XAUUSD now, 2% in profit", "Close XAUUSD now with 2% in profit", "Close now, 3% in the green",
-    "Close XAUUSD now, 50% of the target reached", "Close XAUUSD now, we already took partials",
-    "Close everything now, half of the move is done", "We already secured half\nClose XAUUSD now",
-    "Close XAUUSD now, we made 2% today",
+    "We already secured half\nClose XAUUSD now",
 ])
-def test_full_close_with_a_stray_percent_or_half_is_a_full_close(text):
+def test_full_close_with_a_profit_percent_or_half_on_another_line_is_a_full_close(text):
     assert actions(parse(text)) == ["CLOSE"]
 
 
-def test_full_close_with_a_stray_percent_closes_the_whole_position():
+@pytest.mark.parametrize("text", [
+    # a note about the move, or the size of a partial close written after the comma: which one is not guessed
+    # (before-size-comma-turns-partial-into-full-close)
+    "Close XAUUSD now, 50% of the target reached", "Close XAUUSD now, we already took partials",
+    "Close everything now, half of the move is done", "Close XAUUSD now, we made 2% today",
+])
+def test_full_close_with_a_size_in_another_clause_is_not_guessed(text):
+    r = parse(text)
+    assert r.status is ParseStatus.UNCERTAIN and not r.follow_ups
+    assert [i.reason for i in r.issues] == ["unclear_close_command"]
+
+
+def test_full_close_with_a_stray_percent_closes_nothing_and_tells_the_owner():
     fake = StrictMt5(demo=False)
     p = make(fake)
     post(p, AUDUSD_SIGNAL, 501, NOW)
+    (pos,) = bot_positions(fake)
+    full = pos.volume
     post(p, "Close AUDUSD now, 50% of the target reached", 502, NOW + timedelta(minutes=10), reply_to=501)
-    assert bot_positions(fake) == []
+    assert bot_positions(fake) == [pos] and pos.volume == full
+    assert p.notifier.sent[-1].startswith("⚠️ Не разбрах") and "unclear_close_command" in p.notifier.sent[-1]
 
 
 @pytest.mark.parametrize("text, fraction", [
