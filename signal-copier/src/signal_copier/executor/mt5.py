@@ -46,6 +46,9 @@ NOT_CONNECTED = "терминалът няма връзка със сървър�
 ACCOUNT_TRADE_MODE_DEMO = 0
 ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2
 RES_S_OK = 1
+# a command for a signal whose order is still without answer (SENT): what is done once the order shows up in MT5
+LATER_FOR_UNKNOWN = {FollowUpAction.CLOSE: "ще я затворя", FollowUpAction.CANCEL: "ще я отменя",
+                     FollowUpAction.MOVE_SL_BE: "ще преместя SL", FollowUpAction.MOVE_SL: "ще преместя SL"}
 
 
 class Mt5Error(RuntimeError):
@@ -601,6 +604,11 @@ class Mt5Executor:
             for p in positions + filled:  # never close on a "cancel": say plainly that it is open
                 done.append(f"⚠️ поръчката вече е изпълнена: позиция #{p.ticket} ({p.volume} лота) остава отворена "
                             "със SL/TP, не я затварям автоматично")
+        unseen = [o["client_id"] for o in self.storage.orders_for_signal(signal_key) if o["status"] == "SENT"]
+        if unseen and fu.action in LATER_FOR_UNKNOWN:
+            # it may still turn up (filled late): the monitor runs the command again until it does or is given up
+            done.append(Waiting(f"⏳ поръчката без отговор ({', '.join(unseen)}) още не се вижда в MT5: "
+                                f"{LATER_FOR_UNKNOWN[fu.action]}, щом се появи"))
         return done
 
     async def _cancel_pending(self, signal_key: str) -> tuple[list[str], list]:
@@ -712,6 +720,15 @@ class Mt5Executor:
                                "kind": "filled" if o["status"] == "PENDING" else "recovered"})
                 continue
             if o["status"] == "PENDING":
+                if o["oanda_order_id"] and tag not in await reads.orders():
+                    # no longer working: filled and closed again between two rounds (or while the bot was down)?
+                    # Its position keeps the order's ticket; the loop below then records the close and its P/L
+                    d = await self._opening_deal(int(o["oanda_order_id"]))
+                    if d is not None:
+                        self._adopt(o, NS(ticket=d.position_id, volume=d.volume, price_open=d.price))
+                        opened.append({"trade_id": str(d.position_id), "instrument": o["instrument"],
+                                       "units": d.volume, "price": d.price, "signal_key": o["signal_key"],
+                                       "kind": "filled"})
                 continue
             # a SENT row whose answer was lost may be a working pending order, or filled and closed already
             po = (await reads.orders()).get(tag)
@@ -752,6 +769,15 @@ class Mt5Executor:
             self.storage.close_trade(t["trade_id"], close_price, pl, closed_at)
             closed.append({**t, "realized_pl": str(pl), "close_price": str(close_price)})
         return opened, closed
+
+    async def _opening_deal(self, ticket: int):
+        """The deal that opened position `ticket`, None if there is none or MT5 does not answer (tried next round)."""
+        try:
+            deals = await self.client.read("history_deals_get", position=ticket)
+        except Mt5Error as e:
+            logger.warning("mt5_sync_deals_failed", ticket=ticket, error=str(e))
+            return None
+        return next((d for d in deals if d.entry == self.mt5.DEAL_ENTRY_IN), None)
 
     async def _expire_unseen(self, rows: list[dict], reads: _SyncReads, now: datetime) -> list[dict]:
         """SENT rows (answer lost) that MT5 shows nowhere: not a position, not a pending order, no opening deal.

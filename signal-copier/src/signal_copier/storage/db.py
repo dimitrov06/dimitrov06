@@ -145,15 +145,25 @@ class Storage:
     # -------------------------------------------------------------- messages
 
     def save_message(self, msg: IncomingMessage) -> bool:
-        """False if this exact (message, text) was already stored, i.e. a re-delivery."""
+        """False if this text is already the message's latest version, i.e. a re-delivery.
+
+        An edit back to an earlier text (TP 4498.30 -> 4500.30 -> 4498.30) is a new version, not a re-delivery:
+        that row becomes the latest again (one row per text), so the edit is handled.
+        """
         text_hash = hashlib.sha256(msg.text.encode()).hexdigest()
-        cur = self.conn.execute(
-            "INSERT OR IGNORE INTO messages (chat_id, message_id, edited, text_hash, text, reply_to_msg_id, date, received_at)"
+        latest = self._one("SELECT text_hash FROM messages WHERE chat_id=? AND message_id=? ORDER BY id DESC LIMIT 1",
+                           msg.chat_id, msg.message_id)
+        if latest is not None and latest["text_hash"] == text_hash:
+            return False
+        self.conn.execute("DELETE FROM messages WHERE chat_id=? AND message_id=? AND text_hash=?",
+                          (msg.chat_id, msg.message_id, text_hash))
+        self.conn.execute(
+            "INSERT INTO messages (chat_id, message_id, edited, text_hash, text, reply_to_msg_id, date, received_at)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (msg.chat_id, msg.message_id, int(msg.edited), text_hash, msg.text, msg.reply_to_msg_id,
              msg.date.isoformat(), _now()),
         )
-        return cur.rowcount == 1
+        return True
 
     def set_message_status(self, msg: IncomingMessage, status: str) -> None:
         text_hash = hashlib.sha256(msg.text.encode()).hexdigest()

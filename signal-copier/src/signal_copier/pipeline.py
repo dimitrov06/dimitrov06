@@ -31,14 +31,18 @@ INFO_ONLY = (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)
 EDIT_FIXABLE = ("missing_sl", "uncertain_message:")
 REPLY_HOPS = 3  # "Close" replying to a "TP1 hit" post that replies to the signal
 
+
+def _fmt_tps(tps: list[Decimal]) -> str:
+    return ", ".join(map(str, tps)) or "няма"
+
+
 def _fmt_signal(s: Signal) -> str:
     entry = s.entry.type.value
     if s.entry.price is not None:
         entry += f" @ {s.entry.price}"
     elif s.entry.is_zone:
         entry += f" {s.entry.zone_low}-{s.entry.zone_high}"
-    tps = ", ".join(map(str, s.tp)) or "няма"
-    return f"{s.symbol} {s.side.value} {entry} | SL {s.sl if s.sl is not None else 'няма'} | TP {tps}"
+    return f"{s.symbol} {s.side.value} {entry} | SL {s.sl if s.sl is not None else 'няма'} | TP {_fmt_tps(s.tp)}"
 
 
 
@@ -307,8 +311,9 @@ class Pipeline:
             # "TP1 hit ✅ 4485.10" next to changed numbers: which of them is a level is a guess, so none is moved
             self.storage.add_event("edit", "EDIT_IGNORED", "levels_and_management_text", signal_key=s.key)
             await self.notifier.send(
-                f"⚠️ Каналът редактира сигнал {s.symbol}: смени нивата (SL {old_sl} → {s.sl}, TP {old_tps} → {s.tp})"
-                f" и добави команда/резултат. Не местя SL/TP автоматично, провери.\n\n{s.raw_text[:1000]}")
+                f"⚠️ Каналът редактира сигнал {s.symbol}: смени нивата (SL {old_sl} → {s.sl}, "
+                f"TP {_fmt_tps(old_tps)} → {_fmt_tps(s.tp)}) и добави команда/резултат. Не местя SL/TP автоматично, "
+                f"провери.\n\n{s.raw_text[:1000]}")
         elif changed:
             done: list[str] = []
             if self.mode is not Mode.RECORD and existing["status"] == "EXECUTED":
@@ -319,7 +324,7 @@ class Pipeline:
             self.storage.add_event("edit", "AMENDED", signal_key=s.key,
                                    data={"sl": s.sl, "tp": s.tp, "actions": done})
             await self.notifier.send(
-                f"✏️ Редактиран сигнал {s.symbol}: SL {old_sl} → {s.sl}, TP {old_tps} → {s.tp}"
+                f"✏️ Редактиран сигнал {s.symbol}: SL {old_sl} → {s.sl}, TP {_fmt_tps(old_tps)} → {_fmt_tps(s.tp)}"
                 + (f"\n" + "\n".join(done) if done else "")
             )
         elif not management:
@@ -449,7 +454,8 @@ class Pipeline:
         await self.notifier.send(f"🔧 {label}:\n" + ("\n".join(done) if done else "няма отворени сделки/поръчки"))
 
     async def _retry_waiting(self) -> None:
-        """SL moves that could not be applied yet (BE while the price was behind the entry)."""
+        """Commands that could not be applied yet: an SL move while the price was behind the entry, or a command for
+        an order still without answer (applied once it turns up; it ends when the order is given up)."""
         for row in self.storage.follow_ups_with_status("WAITING"):
             target = self.storage.get_signal(row["signal_key"]) if row["signal_key"] else None
             fu = FollowUp(chat_id=row["chat_id"], message_id=row["message_id"], action=FollowUpAction(row["action"]),
@@ -471,7 +477,7 @@ class Pipeline:
             self.storage.add_event("follow_up", "EXECUTED", "after_waiting", signal_key=target["key"],
                                    message_key=row["key"], data=done)
             await self.notifier.send(f"🔧 {label} (изчакано):\n" + ("\n".join(done) if done else
-                                                                    "сделката вече е затворена"))
+                                                                    "няма отворена сделка или чакаща поръчка"))
 
     # ------------------------------------------------- monitor & commands
 
@@ -571,5 +577,5 @@ class Pipeline:
                 pct = (nav - start) / start * 100 if start else Decimal(0)
                 lines.append(f"Баланс {a['balance']} {a.get('currency', '')}, NAV {a['NAV']}, днес {pct:.2f}%")
             except Exception as e:
-                lines.append(f"OANDA недостъпна: {e!r}")
+                lines.append(f"{self.settings.broker.value.upper()} недостъпен: {e!r}")
         return "\n".join(lines)
