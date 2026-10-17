@@ -24,7 +24,8 @@ telegram:
   session_dir: data       # Telethon session file lives here (keep it secret, it is your login)
 
 parser:
-  rules_file: null      # null = built-in src/signal_copier/parser/rules.yaml
+  rules_file: null      # null = built-in src/signal_copier/parser/rules.yaml. A custom file must be a copy of the
+                        # current built-in one: a file without its command/update sections is refused at start
   # How to treat "XAUUSD BUY 2345" (price/zone without LIMIT/STOP word):
   # market = open at market now, the price is only a reference for risk checks
   bare_price_entry: market   # market | limit

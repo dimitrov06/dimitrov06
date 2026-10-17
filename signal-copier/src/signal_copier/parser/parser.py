@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 
 from signal_copier.models import (
@@ -26,10 +27,33 @@ from signal_copier.parser.rules import ParserRules
 from signal_copier.parser.symbols import SymbolMapper
 
 NUM = r"\d+(?:\.\d+)?"
+INFO_ACTIONS = (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)  # reports: never guarded, never traded
+CLOSE_ACTIONS = (FollowUpAction.CLOSE, FollowUpAction.CLOSE_PARTIAL)
+CLAUSE_END = re.compile(r"[,;:!?\n]|\.(?!\d)")
+SENTENCE_END = re.compile(r"[;!?\n]|\.(?!\d)")
+CLOSE_PRICE = re.compile(r"(?:\bAT|@)[ \t]*\d+(?:\.\d+)?(?![\d:])")
+CLOSE_SIZE = re.compile(r"\b1\s*/\s*2\b|\b\d{1,3}\s*PERCENT\b")
+COMMAND_NOW = re.compile(r"[ \t]*(?:NOW|IMMEDIATELY|ASAP)\b")
+BRACKET_PERCENT = re.compile(r"\((?![^)]*[+\-])[^)]*(?<![\d.])\d{1,3}\s*%")  # "(43%)", not "(+1.43%)" / "(1.43%)"
 PRICE_OR_ZONE = re.compile(rf"(?P<a>{NUM})(?:[ \t]*(?:-|/|~|\bTO\b)[ \t]*(?P<b>{NUM}))?")
 NUMBER = re.compile(NUM)
 DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−"), "-")
 DROP_CATEGORIES = {"So", "Sk", "Cf", "Cs", "Co", "Mn"}
+
+
+@dataclass
+class TpNotes:
+    hit: bool = False  # a hit word in a TP line ("TP1 ✅ 4484.30" too)
+    result: bool = False  # a TP line reports a hit ("Target Profit 1 @ 4484.30 ✅", "TP1 hit")
+    plain: bool = False  # a TP line gives a level without any hit word
+
+
+@dataclass
+class Commands:
+    follow_ups: list[FollowUp] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)  # reasons the commands must not be guessed
+    dropped: bool = False  # a negated, conditional or unclear command was left out
+    spans: list[tuple[int, int]] = field(default_factory=list)  # where commands are written in the block
 
 
 class SignalParser:
@@ -84,29 +108,50 @@ class SignalParser:
     def _parse_block(self, block: str, msg: IncomingMessage, result: ParseResult, signal_index: int) -> None:
         symbol = self.symbols.find(block)
         sides = {s for s, pats in self.rules.side.items() if any(p.search(block) for p in pats)}
-        follow_ups = self._follow_ups(block, msg, symbol.instrument if symbol else None)
+        cmds = self._commands(block, msg, symbol.instrument if symbol else None)
+        follow_ups = cmds.follow_ups
         sl = self._find_sl(block)
-        tps = self._find_tps(block)
+        tps, tp_notes = self._scan_tps(block)
 
         if len(sides) > 1:
             result.issues.append(ParseIssue(reason="conflicting_sides", text=block))
             return
 
-        management = not sides or (sl is None and not tps)
-        if management and any(p.search(block) for p in self.rules.unclear):
-            # "move SL to 20 pips in profit", "SL to 1:1": a distance or ratio, not a price
-            result.issues.append(ParseIssue(reason="unclear_sl_command", text=block))
-            return
-        actionable = [f for f in follow_ups if f.action not in (FollowUpAction.TP_HIT, FollowUpAction.SL_HIT)]
-        if management and actionable and len({m.instrument for m in self.symbols.find_all(block)}) > 1:
-            # "Close AUDUSD and XAUUSD now": one command per symbol is not guessed
-            result.issues.append(ParseIssue(reason="command_for_several_symbols", text=block))
+        levels = sl is not None or bool(tps)
+        entry_line = self._has_entry_instruction(self._blank(block, cmds.spans))  # "move SL to BE now" is no entry
+        reported = self._reports(block, follow_ups, tp_notes)
+        updating = any(p.search(block) for p in self.rules.update_words)
+        # "XAUUSD Buy update / TP1 @ 4484.30 hit ✅ / Stop Loss @ 4479.69 (moved to entry)", "XAUUSD Buy new SL 4475":
+        # a side word and a level, but nothing that says to open a trade -> about a running trade, never a new one
+        update = bool(sides) and levels and not entry_line and bool(
+            follow_ups or cmds.problems or cmds.dropped or reported or tp_notes.hit or updating)
+
+        management = not sides or (sl is None and not tps) or update
+        if management:
+            issue = self._management_issue(block, follow_ups, cmds)
+            if issue:
+                result.issues.append(ParseIssue(reason=issue, text=block))
+                return
+
+        if update:
+            self._update_block(block, result, follow_ups, sl, tp_notes, reported, updating)
             return
 
         if sides:
-            if follow_ups and sl is None and not tps:
-                # "Gold buy running, move SL to BE" is management, not a new trade
-                result.follow_ups.extend(follow_ups)
+            if sl is None and not tps:
+                if follow_ups:
+                    # "Gold buy running, move SL to BE" is management, not a new trade
+                    result.follow_ups.extend(follow_ups)
+                    return
+                if not entry_line and (reported or updating):
+                    return  # "XAUUSD Buy running nicely": chatter about a trade
+            elif not entry_line and not tps:
+                # "XAUUSD Buy - SL @ 4475": no entry line and no TP, nothing says to open a trade
+                result.issues.append(ParseIssue(reason="incomplete_signal", text=block))
+                return
+            elif not entry_line and msg.reply_to_msg_id is not None:
+                # a reply that repeats levels without an entry line is about the replied trade, not a new one
+                result.issues.append(ParseIssue(reason="reply_without_entry", text=block))
                 return
             if symbol is None:
                 result.issues.append(ParseIssue(reason="unknown_symbol", text=block))
@@ -114,11 +159,18 @@ class SignalParser:
             signal_or_issue = self._build_signal(block, msg, symbol, Side(sides.pop()), sl, tps, signal_index)
             if isinstance(signal_or_issue, ParseIssue):
                 result.issues.append(signal_or_issue)
-            else:
-                if follow_ups:
-                    signal_or_issue.warnings.append("contains_management_text")
-                    signal_or_issue.management = follow_ups
-                result.signals.append(signal_or_issue)
+                return
+            if follow_ups or cmds.dropped:
+                signal_or_issue.warnings.append("contains_management_text")
+                signal_or_issue.management = follow_ups
+            if reported or updating:
+                signal_or_issue.warnings.append("contains_result_text")
+            result.signals.append(signal_or_issue)
+            if not msg.edited:
+                problem = self._new_post_problem(follow_ups, tps, reported, updating)
+                if problem:
+                    # kept in signals so a later edit can tell which commands the post already had
+                    result.issues.append(ParseIssue(reason=problem, text=block))
             return
 
         if follow_ups:
@@ -129,6 +181,60 @@ class SignalParser:
             result.issues.append(ParseIssue(reason="missing_side", text=block))
         # otherwise: chatter / results post -> ignored
 
+    def _management_issue(self, block: str, follow_ups: list[FollowUp], cmds: Commands) -> str | None:
+        """Why a message without a new signal must not be acted on (None: carry out its commands)."""
+        if any(p.search(block) for p in self.rules.unclear):
+            return "unclear_sl_command"  # "move SL to 20 pips in profit", "SL to 1:1": a distance, not a price
+        if cmds.problems:
+            return cmds.problems[0]  # "close half at TP1", "Closing XAUUSD", "Close at 23:00"
+        actionable = [f for f in follow_ups if f.action not in INFO_ACTIONS]
+        if actionable and len({m.instrument for m in self.symbols.find_all(block)}) > 1:
+            return "command_for_several_symbols"  # "Close AUDUSD and XAUUSD now": not guessed
+        return None
+
+    def _update_block(self, block, result: ParseResult, follow_ups, sl, tp_notes: TpNotes, reported, updating) -> None:
+        """A side word and levels without an entry line: the channel talks about a running trade."""
+        if isinstance(sl, ParseIssue):
+            result.issues.append(sl)
+            return
+        actionable = [f for f in follow_ups if f.action not in INFO_ACTIONS]
+        moves = [f.price for f in actionable if f.action is FollowUpAction.MOVE_SL]
+        if sl is not None and not (moves and all(m == sl for m in moves)):
+            # "Stop Loss @ 4479.69 (moved to entry)", "close half / Stop Loss @ x": which SL is meant is not guessed
+            result.issues.append(ParseIssue(reason="update_with_levels", text=block))
+            return
+        if tp_notes.plain:
+            # "XAUUSD Buy move SL to BE / TP2 @ 4500": a new TP is not guessed
+            result.issues.append(ParseIssue(reason="update_with_levels", text=block))
+            return
+        if not actionable and (not reported or updating or self.rules.sl_keyword.search(block)):
+            # "XAUUSD Buy / TP1 @ 4484.30 ✅ / Update the SL to the entry price" with no command the bot knows
+            result.issues.append(ParseIssue(reason="update_not_understood", text=block))
+            return
+        result.follow_ups.extend(follow_ups)  # "XAUUSD Buy running ✅ TP1 @ 4484.30 reached, move SL to BE"
+
+    @staticmethod
+    def _new_post_problem(follow_ups: list[FollowUp], tps, reported: bool, updating: bool) -> str | None:
+        """A new (not edited) post with a whole signal that is not a plain new trade."""
+        if reported or any(f.action in (FollowUpAction.CLOSE, FollowUpAction.CANCEL) for f in follow_ups):
+            return "signal_with_result_text"  # a repost "... Closed manually at 4478 ❌", a cancel quoting the order
+        if updating or (not tps and any(f.action not in INFO_ACTIONS for f in follow_ups)):
+            return "signal_with_update_text"  # "XAUUSD Buy 4480 running, new SL 4475"
+        return None
+
+    def _reports(self, block: str, follow_ups: list[FollowUp], tp_notes: TpNotes) -> bool:
+        """The block reports what already happened (TP/SL hit, closed, cancelled). "TP1 ✅ 2350" is a level."""
+        return (tp_notes.result or any(f.action is FollowUpAction.SL_HIT for f in follow_ups)
+                or any(p.search(block) for p in self.rules.results))
+
+    def _has_entry_instruction(self, block: str) -> bool:
+        """An order type, a market word or an entry price: the block says to open a trade."""
+        if any(p.search(block) for pats in self.rules.pending_order.values() for p in pats):
+            return True
+        if any(p.search(block) for p in self.rules.market_words):
+            return True
+        return self._find_entry(block) != (None, None)
+
     # ---------------------------------------------------------------- signal
 
     def _build_signal(
@@ -138,10 +244,12 @@ class SignalParser:
         if isinstance(sl, ParseIssue):
             return sl
 
-        pending = next(
-            (t for t, pats in self.rules.pending_order.items() if any(p.search(block) for p in pats)), None
-        )
+        pending_types = {t for t, pats in self.rules.pending_order.items() if any(p.search(block) for p in pats)}
         is_market = any(p.search(block) for p in self.rules.market_words)
+        if len(pending_types) > 1 or self._unrecognised_order_type(block, is_market or bool(pending_types)):
+            # "Buy Stp Order @", "Sell Limt Order @", "Buy Stop Limit @": never taken at market by mistake
+            return ParseIssue(reason="unclear_entry_type", text=block)
+        pending = next(iter(pending_types), None)
         price, zone = self._find_entry(block)
 
         if pending and price is None and zone is None:
@@ -184,6 +292,35 @@ class SignalParser:
             warnings=warnings,
         )
 
+    def _unrecognised_order_type(self, block: str, typed: bool) -> bool:
+        """The entry line names an order type that pending_order does not know (a typo or another wording).
+
+        `typed`: a market word or a recognised pending type is there, so ORDER alone is fine ("Buy Market Order").
+        """
+        for line in self._entry_lines(block):
+            for pats in self.rules.pending_order.values():
+                for p in pats:
+                    line = p.sub(" ", line)  # what is left of "Buy Stop Limit Order" after "BUY STOP" is "LIMIT"
+            if self.rules.pending_hint and self.rules.pending_hint.search(line):
+                return True
+            if self.rules.order_word and not typed and self.rules.order_word.search(line):
+                return True
+        return False
+
+    def _entry_lines(self, block: str) -> list[str]:
+        """Lines with BUY/SELL or "@", cut before any SL/TP keyword."""
+        lines = []
+        for line in block.splitlines():
+            cut = len(line)
+            for kw in (self.rules.sl_keyword, self.rules.tp_keyword):
+                m = kw.search(line)
+                if m:
+                    cut = min(cut, m.start())
+            line = line[:cut]
+            if "@" in line or any(p.search(line) for pats in self.rules.side.values() for p in pats):
+                lines.append(line)
+        return lines
+
     def _find_sl(self, block: str) -> Decimal | ParseIssue | None:
         values = {Decimal(m.group("price")) for line in block.splitlines() for m in self.rules.sl.finditer(line)}
         if len(values) > 1:
@@ -191,13 +328,18 @@ class SignalParser:
         return values.pop() if values else None
 
     def _find_tps(self, block: str) -> list[Decimal]:
+        return self._scan_tps(block)[0]
+
+    def _scan_tps(self, block: str) -> tuple[list[Decimal], TpNotes]:
         """TP levels in order. "TP2" is the second level wherever it is written (the "last" TP is the highest label).
 
         A result note is not a level: numbers after HIT are dropped ("Target Profit 1 @ 4484.30 ✅ hit at 4485.10"
         -> 4484.30), and a label that already appeared ignores later lines ("TP1 hit ✅ 4485.10" under the TP lines).
+        The notes say whether a TP line reports a hit ("4484.30 ✅", "TP1 hit") and whether one is a plain level.
         """
         found: list[tuple[int | None, Decimal]] = []
         labels: set[int] = set()
+        notes = TpNotes()
         for line in block.splitlines():
             if not self.rules.tp_keyword.search(line):
                 continue
@@ -208,12 +350,18 @@ class SignalParser:
                 segment = line[kw.end(): keywords[i + 1].start() if i + 1 < len(keywords) else len(line)]
                 digit = re.search(r"\d", kw.group())
                 label = int(digit.group()) if digit else None
-                if label is not None and label in labels:
-                    continue  # "TP1 hit ✅ 4485.10" under the TP1 line: a result, not a new level
                 hit = self.rules.tp_hit.search(segment)
+                notes.hit = notes.hit or bool(hit)
+                if label is not None and label in labels:
+                    notes.result = notes.result or bool(hit)
+                    continue  # "TP1 hit ✅ 4485.10" under the TP1 line: a result, not a new level
+                if hit and NUMBER.search(segment[: hit.start()]) or hit and not NUMBER.search(segment):
+                    notes.result = True  # "Target Profit 1 @ 4484.30 ✅", "TP1 hit"
                 if hit and (label is None or NUMBER.search(segment[: hit.start()])):
                     segment = segment[: hit.start()]  # "TP1 4484.30 hit at 4485.10" ("TP1 ✅ 4484.30" is a level)
-                for n in NUMBER.findall(segment):
+                numbers = NUMBER.findall(segment)
+                notes.plain = notes.plain or bool(numbers and not hit)
+                for n in numbers:
                     value = Decimal(n)
                     if all(value != v for _, v in found):
                         found.append((label, value))
@@ -221,7 +369,7 @@ class SignalParser:
                     labels.add(label)
         if found and all(label is not None for label, _ in found):
             found.sort(key=lambda x: x[0])
-        return [v for _, v in found]
+        return [v for _, v in found], notes
 
     def _find_entry(self, block: str) -> tuple[Decimal | None, tuple[Decimal, Decimal] | None]:
         lines = block.splitlines()
@@ -296,38 +444,127 @@ class SignalParser:
 
     # ------------------------------------------------------------- follow-ups
 
-    def _follow_ups(self, block: str, msg: IncomingMessage, symbol: str | None) -> list[FollowUp]:
+    def _commands(self, block: str, msg: IncomingMessage, symbol: str | None) -> Commands:
+        """Commands written in the block, in command form only.
+
+        Descriptive phrases ("very close to TP1", "weekly close") are blanked out first. A command after a negation
+        in its clause ("Don't close yet") is left out. A command in a sentence with a condition ("once TP1 is hit",
+        "at TP1") or a CLOSE with numbers the bot cannot place ("Close at 23:00") is a problem, and so is a command
+        word that is not part of any recognised command ("Closing XAUUSD").
+        """
+        text = self._blank_descriptions(block)
+        cmds = Commands()
         found: dict[FollowUpAction, FollowUp] = {}
         suppressed: set[FollowUpAction] = set()
+        covered = cmds.spans
         for rule in self.rules.follow_ups:
+            guarded = rule.action not in INFO_ACTIONS
+            fu = None
+            left_out = False
             for pattern in rule.patterns:
-                m = pattern.search(block)
-                if not m:
-                    continue
-                groups = m.groupdict()
-                fu = FollowUp(
-                    chat_id=msg.chat_id,
-                    message_id=msg.message_id,
-                    action=rule.action,
-                    reply_to_msg_id=msg.reply_to_msg_id,
-                    symbol=symbol,
-                    raw_text=msg.text,
-                    date=msg.date,
-                    edited=msg.edited,
-                )
-                if rule.action is FollowUpAction.CLOSE_PARTIAL:
-                    pct = groups.get("percent")
-                    fu.fraction = Decimal(pct) / 100 if pct else rule.default_fraction
-                    if fu.fraction is not None and fu.fraction >= 1:
-                        fu.action, fu.fraction = FollowUpAction.CLOSE, None
-                    elif not fu.fraction or fu.fraction <= 0:
+                for m in pattern.finditer(text):
+                    covered.append(m.span())
+                    if fu is not None:
                         continue
-                if groups.get("price"):
-                    fu.price = Decimal(groups["price"])
-                if groups.get("tp"):
-                    fu.tp_index = int(groups["tp"])
-                found.setdefault(fu.action, fu)
-                if fu.action is rule.action:  # "close 100%" became CLOSE: suppress nothing
-                    suppressed |= rule.suppresses
-                break
-        return [fu for action, fu in found.items() if action not in suppressed]
+                    problem = self._guard(text, m) if guarded else None
+                    if problem:
+                        left_out = True
+                        cmds.problems.append(problem)
+                        continue
+                    fu = self._follow_up(rule, m, msg, symbol)
+                    if fu is not None and fu.action in CLOSE_ACTIONS and self._unexplained_numbers(text, m, fu.action):
+                        left_out = True
+                        cmds.problems.append("unclear_close_command")
+                        fu = None
+            cmds.dropped = cmds.dropped or left_out
+            if fu is None:
+                if left_out:
+                    suppressed |= rule.suppresses  # "don't close half" / "close half at TP1" is never a full close
+                continue
+            found.setdefault(fu.action, fu)
+            if fu.action is rule.action:  # "close 100%" became CLOSE: suppress nothing
+                suppressed |= rule.suppresses
+        for word in self.rules.command_words:
+            for m in word.finditer(text):
+                if not any(a < m.end() and m.start() < b for a, b in covered):
+                    # "Don't close yet", "Closing XAUUSD", "Gold could break even higher"
+                    cmds.problems.append("negated_command" if self._before_in_clause(self.rules.negation, text, m)
+                                         else "unclear_command")
+        cmds.follow_ups = [fu for action, fu in found.items() if action not in suppressed]
+        return cmds
+
+    def _follow_up(self, rule, m: re.Match, msg: IncomingMessage, symbol: str | None) -> FollowUp | None:
+        groups = m.groupdict()
+        fu = FollowUp(
+            chat_id=msg.chat_id,
+            message_id=msg.message_id,
+            action=rule.action,
+            reply_to_msg_id=msg.reply_to_msg_id,
+            symbol=symbol,
+            raw_text=msg.text,
+            date=msg.date,
+            edited=msg.edited,
+        )
+        if rule.action is FollowUpAction.CLOSE_PARTIAL:
+            pct = groups.get("percent")
+            fu.fraction = Decimal(pct) / 100 if pct else rule.default_fraction
+            if fu.fraction is not None and fu.fraction >= 1:
+                fu.action, fu.fraction = FollowUpAction.CLOSE, None
+            elif not fu.fraction or fu.fraction <= 0:
+                return None
+        if groups.get("price"):
+            fu.price = Decimal(groups["price"])
+        if groups.get("tp"):
+            fu.tp_index = int(groups["tp"])
+        return fu
+
+    def _blank_descriptions(self, block: str) -> str:
+        for p in self.rules.not_commands:
+            block = p.sub(lambda m: " " * len(m.group()), block)  # same length: positions stay valid
+        return block
+
+    @staticmethod
+    def _blank(block: str, spans: list[tuple[int, int]]) -> str:
+        """The block without its commands (and a "now" right after one: "move SL to BE now")."""
+        chars = list(block)
+        for a, b in spans:
+            now = COMMAND_NOW.match(block, b)
+            b = now.end() if now else b
+            chars[a:b] = [c if c == "\n" else " " for c in chars[a:b]]
+        return "".join(chars)
+
+    def _guard(self, text: str, m: re.Match) -> str | None:
+        """Why the command matched at `m` must not be carried out now (None: it is an order for now)."""
+        if self._before_in_clause(self.rules.negation, text, m):
+            return "negated_command"  # "Don't close yet", "Do not cancel your order"
+        if self._before_in_clause(self.rules.modal, text, m):
+            return "conditional_command"  # "We will move SL to break even"
+        if self.rules.condition and self.rules.condition.search(self._sentence(text, m)):
+            return "conditional_command"  # "Move SL to BE once TP1 is hit", "Close half at TP1"
+        return None
+
+    @staticmethod
+    def _before_in_clause(pattern: re.Pattern | None, text: str, m: re.Match) -> bool:
+        if pattern is None:
+            return False
+        start = max((b.end() for b in CLAUSE_END.finditer(text, 0, m.start())), default=0)
+        return bool(pattern.search(text, start, m.start()))
+
+    def _sentence(self, text: str, m: re.Match) -> str:
+        start = max((b.end() for b in SENTENCE_END.finditer(text, 0, m.start())), default=0)
+        end = SENTENCE_END.search(text, m.end())
+        return text[start: end.start() if end else len(text)]
+
+    def _unexplained_numbers(self, text: str, m: re.Match, action: FollowUpAction) -> bool:
+        """A close whose sentence has numbers besides the close price, the size and P/L notes: "Close at 23:00".
+
+        A whole percent in brackets on a full close ("Close AUDUSD (50%)") may be a size or a P/L: not guessed.
+        """
+        sentence = self.symbols.remove(self._sentence(text, m))  # "US30", "NAS100"
+        if action is FollowUpAction.CLOSE and BRACKET_PERCENT.search(sentence):
+            return True
+        sentence = CLOSE_PRICE.sub(" ", sentence)
+        sentence = self.rules.tp_keyword.sub(" ", sentence)  # "TP1 hit, close now"
+        sentence = self._strip_noise(sentence)  # "(+1.43%)", "+80 pips", "50%"
+        sentence = CLOSE_SIZE.sub(" ", sentence)  # "1/2", "50 percent"
+        return bool(re.search(r"\d", sentence))

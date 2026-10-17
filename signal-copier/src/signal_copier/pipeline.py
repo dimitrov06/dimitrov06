@@ -263,6 +263,10 @@ class Pipeline:
         new = self._new_management(s, existing)
         if new:
             return "редакцията добавя команда/резултат (" + ", ".join(f.action.value for f in new) + ")"
+        # a post that quotes an order next to "Cancel"/"Closed manually" is not a new trade, edited or not
+        commands = [f.action.value for f in s.management if f.action not in INFO_ONLY]
+        if commands or "contains_result_text" in s.warnings:
+            return "постът съдържа команда/резултат (" + ", ".join(commands or ["резултат"]) + "), не е нов сигнал"
         return None
 
     async def _evaluate(self, s: Signal):

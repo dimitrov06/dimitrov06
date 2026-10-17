@@ -147,3 +147,35 @@ def test_rted_cancel_pending_order_2026_10_16(parser):
     assert r.status is ParseStatus.FOLLOW_UP
     fu = r.follow_ups[0]
     assert (fu.action, fu.symbol, fu.reply_to_msg_id) == (FollowUpAction.CANCEL, "XAU_USD", 1522)
+
+
+# The parser reads commands only in command form (C14) and never takes an update for a new trade (C15).
+# These guards keep the real formats exactly as they were.
+
+@pytest.mark.parametrize("text", [AUDUSD_SIGNAL, AUDCAD_SIGNAL, XAUUSD_SIGNAL,
+                                  "RTED Investing - Premium Trading Signals 🏆\nXAUUSD\nSell Limit Order @ 4156.56\n"
+                                  "Target Profit 1 @ 4153.58\nTarget Profit 2 @ 4142.80\nStop Loss @ 4162.55"])
+def test_rted_signals_carry_no_command_and_no_result(parser, text):
+    r = parser.parse(msg(text, 900))
+    assert r.status is ParseStatus.SIGNAL and not r.follow_ups and not r.issues
+    assert r.signals[0].management == [] and r.signals[0].warnings == []
+
+
+@pytest.mark.parametrize("text, action, price", [
+    (AUDUSD_CLOSE, FollowUpAction.CLOSE, "0.69530"),
+    ("‼️ Close XAUUSD Manually now at 4485.10! (+0.50%)", FollowUpAction.CLOSE, "4485.10"),
+    ("‼️ Close XAUUSD Manually now at 4478.00! (-0.2%)", FollowUpAction.CLOSE, "4478.00"),
+    ("Cancel Pending Order on XAUUSD", FollowUpAction.CANCEL, None),
+])
+def test_rted_commands_are_exactly_one_command(parser, text, action, price):
+    r = parser.parse(msg(text, 901, reply_to=900))
+    assert r.status is ParseStatus.FOLLOW_UP and [f.action for f in r.follow_ups] == [action]
+    assert r.follow_ups[0].fraction is None and r.follow_ups[0].price == (D(price) if price else None)
+
+
+def test_rted_sell_limit_with_a_typo_in_the_order_type_is_not_taken_at_market(parser):
+    """The channel types by hand ("Bu now" was seen): "Sell Limt Order" must never become a market sell."""
+    text = ("RTED Investing - Premium Trading Signals 🏆\nXAUUSD\nSell Limt Order @ 4156.56\n"
+            "Target Profit 1 @ 4153.58\nTarget Profit 2 @ 4142.80\nStop Loss @ 4162.55")
+    r = parser.parse(msg(text, 902))
+    assert r.status is ParseStatus.UNCERTAIN and not r.signals
